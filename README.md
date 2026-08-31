@@ -40,7 +40,6 @@ heap_spray/
 ├── requirements.txt                   # 真机依赖清单（仅 numpy）
 ├── models/                            # 检测模型（torch AE 包装 + sklearn）
 │   ├── torch_ae.py                    # TorchAEWrapper：window/sequence 训练打分胶水
-│   ├── lstm_enc.py                    # LSTM encoder + 单类密度头（ocsvm/gmm/if）
 │   ├── mlp_ae.py / lstm_ae.py / lstm_vae.py   # 深度学习自编码器（nn.Module）
 │   └── ocsvm.py / isolation_forest.py / lof_detector.py / pca_detector.py / stat_threshold.py
 ├── scripts/
@@ -169,7 +168,6 @@ csv2features → pilot_gates（G1–G6+G9）。产出 `processed/{attack,normal}
 |------|------|---------|
 | **ocsvm**（主检测） | One-Class SVM | 窗口/序列级 |
 | **mlp_ae**（高吞吐替代） | MLP 自编码器 | 窗口级 |
-| **lstm_enc** | LSTM encoder + 单类密度头（ocsvm/gmm/isolation_forest） | 序列级 |
 | lstm_ae | LSTM 自编码器 | 序列级 |
 | lstm_vae | LSTM 变分自编码器（β 退火 + free bits） | 序列级 |
 
@@ -184,7 +182,6 @@ PROC_A=$DATA/processed/attack; PROC_N=$DATA/processed/normal
 
 python scripts/train/run_experiment.py --model ocsvm --attack-data $PROC_A \
     --normal-data $PROC_N --dataset-manifest $DATA/dataset_manifest.json --out runs
-python scripts/train/run_experiment.py --model lstm_enc ...  # 同上，换模型名
 python scripts/train/run_experiment.py --model mlp_ae  ...
 python scripts/train/run_experiment.py --model lstm_ae ...
 ```
