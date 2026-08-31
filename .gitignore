@@ -1,0 +1,33 @@
+# ---- Python / venv ----
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# ---- 采集数据（大，不入库）----
+# 11G 原始/CSV/processed 数据，含 QEMU 镜像、trace、manifest
+datasets/
+data/
+
+# ---- 实验结果 / 模型产物 ----
+runs/
+
+# ---- KHeaps 第三方仓库 ----
+# KHeaps 是独立的 git 仓库（https://github.com/sefcom/KHeaps.git），
+# 其自身有 .git，修改应提交到 KHeaps 仓库，而非此仓库。
+# 如需版本管理其修改，改用 `git submodule add https://github.com/sefcom/KHeaps.git KHeaps`
+KHeaps/
+
+# ---- 日志 / 临时文件 ----
+*.log
+*.tmp
+*.swp
+*~
+.DS_Store
+
+# ---- 本地配置文件 ----
+# 若某台机器的路径/凭据与本仓库无关，保留本地版本
+.local/

@@ -1,0 +1,23 @@
+# heap_spray 真机（仿真模拟 / 采集 / 构建）环境依赖清单
+#
+# 适用环境：真机（宿主机）运行仿真模拟管线 —— QEMU 采集、trace→CSV、特征构建、数据侧门禁。
+# 模型训练不在真机进行：训练相关库（torch、scikit-learn、scipy、matplotlib、pandas 等）
+# 安装于独立的 PyTorch Docker 中，见 scripts/train/ 与 IMPLEMENTATION_PLAN.md。
+# 本文件只含真机环境运行仿真模拟真正 import 的库。
+#
+# 安装（Python 3.12，建议新服务器对齐 3.12）：
+#     python3 -m venv .venv
+#     .venv/bin/pip install -r requirements.txt
+#
+# 真机侧为何只需 numpy：
+#   - 采集器 scripts/collect/collect_stable.py、collect_attack_stable.py
+#     （含 collection_common.py、qemu_runner.py）：仅用 Python 标准库 + 项目内模块，
+#     零第三方依赖；QEMU/ssh/gcc 等以系统命令调用（见 IMPLEMENTATION_PLAN.md host 前置要求）。
+#   - trace→CSV scripts/preprocess/trace2csv.py：仅标准库。
+#   - 特征构建与门禁 scripts/preprocess/csv2features.py、scripts/validate/pilot_gates.py：
+#     唯一第三方依赖为 numpy。
+#   - 共同依赖 scripts/common/io.py、config.py：均纯标准库。
+#
+# 版本与项目 .venv 冻结一致（2026-08-21，Python 3.12.3），保证特征构建结果可复现。
+
+numpy==2.5.2

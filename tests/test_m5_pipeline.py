@@ -1,0 +1,296 @@
+"""M5 end-to-end integration test (IMPLEMENTATION_PLAN.md 10.2).
+
+Synthetic traces -> trace2csv -> csv2features -> train/evaluate harness, then
+asserts the no-leak guarantees and determinism:
+  * run split partitions are pairwise disjoint (G7);
+  * the baseline model trains and evaluates end-to-end with finite metrics (G8);
+  * repeating the experiment produces identical reports (deterministic hash);
+  * the decision threshold is the validation-normal percentile, not a test-set
+    optimum.
+"""
+
+import csv
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import config
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts", "train"))
+from scripts.train import common
+
+ROOT = Path(__file__).resolve().parents[1]
+TRACE2CSV = ROOT / "scripts" / "preprocess" / "trace2csv.py"
+CSV2FEATURES = ROOT / "scripts" / "preprocess" / "csv2features.py"
+RUN_EXPERIMENT = ROOT / "scripts" / "train" / "run_experiment.py"
+VENV_PY = ROOT / ".venv" / "bin" / "python3"
+
+
+def run(cmd, cwd):
+    result = subprocess.run([str(c) for c in cmd], cwd=str(cwd), capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"command failed: {' '.join(map(str, cmd))}\n{result.stdout}\n{result.stderr}")
+    return result.stdout
+
+
+def kmalloc_line(comm, pid, ts_ns, ptr, bytes_alloc):
+    return ("  {}-{:<5} [000] ...1 {:.6f}: kmalloc: "
+            "call_site=ffffffff8139c7f1 ptr={:016x} bytes_req={} bytes_alloc={} gfp_flags=GFP_KERNEL"
+            .format(comm, pid, ts_ns / 1e9, ptr, bytes_alloc, bytes_alloc))
+
+
+def kfree_line(comm, pid, ts_ns, ptr):
+    return "  {}-{:<5} [000] ...1 {:.6f}: kfree: call_site=ffffffff8136ccd1 ptr={:016x}".format(
+        comm, pid, ts_ns / 1e9, ptr)
+
+
+def write_trace(path, background_size, spray=None, spray_start_ns=None, spray_end_ns=None):
+    """Write an ftrace-style trace.log.
+
+    background_size: allocation bytes used at ~10ms cadence over ~3.5s.
+    spray: (interval_ns, alloc_bytes, count) burst written between markers when given.
+    """
+    lines = []
+    ts = 500_000_000  # start well inside the first second
+    ptr = 0x1000
+    end = 4_000_000_000
+    while ts < end:
+        lines.append(kmalloc_line("wl", 100, ts, ptr, background_size))
+        ptr += 0x100
+        ts += 10_000_000
+        # occasional free keeps ptr reuse realistic
+        if ts % 30_000_000 == 0:
+            lines.append(kfree_line("wl", 100, ts, ptr - 0x80))
+    if spray:
+        interval, size, count = spray
+        ts = spray_start_ns
+        for i in range(count):
+            lines.append(kmalloc_line("poc", 200, ts, ptr, size))
+            ptr += 0x100
+            ts += interval
+    with open(path, "w") as handle:
+        for line in lines:
+            handle.write(line + "\n")
+
+
+def build_synthetic_root(tmp):
+    """Create raw/attack + raw/normal with 2 attack, 4 idle, 3 baseline runs."""
+    root = Path(tmp)
+    spray_start, spray_end = 2_000_000_000, 2_200_000_000
+    attack_dir = root / "raw" / "attack" / "CVE-SYN-ATT" / "poc_spray"
+    normal_dir = root / "raw" / "normal" / "CVE-SYN" / "idle"
+    base_dir = root / "raw" / "normal" / "CVE-SYN" / "poc_cfh_baseline"
+
+    for i in range(2):
+        d = attack_dir / f"run_00{i}_synatt{i}"
+        d.mkdir(parents=True)
+        write_trace(d / "trace.log", 96, spray=(500_000, 512, 300),
+                    spray_start_ns=spray_start, spray_end_ns=spray_end)
+        with open(d / "manifest.json", "w") as f:
+            json.dump({"status": "valid", "class": "attack", "cve": "CVE-SYN-ATT",
+                       "variant": "poc_spray", "spray_start_ns": spray_start,
+                       "spray_end_ns": spray_end}, f)
+
+    for i in range(4):
+        d = normal_dir / f"run_00{i}_syn{i}"
+        d.mkdir(parents=True)
+        write_trace(d / "trace.log", 96)
+        with open(d / "manifest.json", "w") as f:
+            json.dump({"status": "valid", "class": "normal", "cve": "CVE-SYN",
+                       "workload": "idle"}, f)
+
+    for i in range(3):
+        d = base_dir / f"run_00{i}_syn{i}"
+        d.mkdir(parents=True)
+        write_trace(d / "trace.log", 96)
+        with open(d / "manifest.json", "w") as f:
+            json.dump({"status": "valid", "class": "normal", "cve": "CVE-SYN",
+                       "workload": "poc_cfh_baseline"}, f)
+
+    return root / "raw"
+
+
+class TestM5Pipeline(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="m5_pipe_")
+        self.raw = Path(self.tmp) / "raw"
+        self.out = Path(self.tmp) / "pilot"
+        build_synthetic_root(self.tmp)
+        self.run_pipeline()
+
+    def run_pipeline(self):
+        out = self.out
+        csv_attack = out / "csv" / "attack"
+        csv_normal = out / "csv" / "normal"
+        proc_attack = out / "processed" / "attack"
+        proc_normal = out / "processed" / "normal"
+        for d in (csv_attack, csv_normal, proc_attack, proc_normal):
+            d.mkdir(parents=True, exist_ok=True)
+
+        run([sys.executable, TRACE2CSV, "-i", self.raw / "attack", "-o", csv_attack], cwd=ROOT)
+        run([sys.executable, TRACE2CSV, "-i", self.raw / "normal", "-o", csv_normal], cwd=ROOT)
+        run([sys.executable, CSV2FEATURES, "-i", csv_attack, "-o", proc_attack,
+             "-w", 100, "-s", 50, "--seq-len", 32, "--is-attack",
+             "--markers", csv_attack / "spray_markers.json",
+             "--sequence-label", "any", "--force"], cwd=ROOT)
+        run([sys.executable, CSV2FEATURES, "-i", csv_normal, "-o", proc_normal,
+             "-w", 100, "-s", 50, "--seq-len", 32, "--force"], cwd=ROOT)
+
+        runs_dir = Path(self.tmp) / "runs"
+        run([VENV_PY, RUN_EXPERIMENT, "--model", "stat_threshold",
+             "--attack-data", proc_attack, "--normal-data", proc_normal,
+             "--out", runs_dir], cwd=ROOT)
+        self.experiments = sorted(p for p in runs_dir.iterdir() if p.is_dir())
+
+    def test_end_to_end_artifacts_and_gates(self):
+        self.assertEqual(len(self.experiments), 1)
+        exp = self.experiments[0]
+        for name in ("split_manifest.json", "scaler.npz", "model.pkl",
+                     "train_report.json", "evaluation_report.json",
+                     "metrics.csv", "gates.json"):
+            self.assertTrue((exp / name).exists(), f"missing {name}")
+        gates = json.loads((exp / "gates.json").read_text())
+        for gate in gates:
+            self.assertTrue(gate["ok"], f"gate failed: {gate['name']}: {gate['detail']}")
+
+        report = json.loads((exp / "evaluation_report.json").read_text())
+        seq = report["sequence_level"]
+        self.assertTrue(all(k in seq for k in ("roc_auc", "pr_auc", "f1_at_threshold",
+                                                "fpr_at_threshold")))
+        self.assertTrue(np.isfinite(seq["roc_auc"]))
+        # the synthetic spray is dense/large enough that the baseline must beat chance
+        self.assertGreater(seq["roc_auc"], 0.5)
+
+    def test_run_split_disjoint(self):
+        split = json.loads((self.experiments[0] / "split_manifest.json").read_text())
+        for a, b in (("train_groups", "val_groups"), ("train_groups", "test_groups"),
+                     ("val_groups", "test_groups")):
+            self.assertEqual(set(split[a]) & set(split[b]), set(), f"{a}/{b} overlap")
+
+    def test_threshold_is_validation_percentile_not_test_optimum(self):
+        exp = self.experiments[0]
+        train = json.loads((exp / "train_report.json").read_text())
+        report = json.loads((exp / "evaluation_report.json").read_text())
+        threshold = train["threshold"]
+        # threshold must equal the p(1-fpr) percentile of the calibration scores;
+        # recompute it from the val set through the saved model to prove no test
+        # information entered calibration.
+        normal = np.load(self.out / "processed" / "normal" / "features.npz",
+                         allow_pickle=True)
+        split = json.loads((exp / "split_manifest.json").read_text())
+        val_groups = set(split["val_groups"])
+        val_mask = np.isin(normal["seq_run_ids"].astype(str), list(val_groups))
+        val_seq = normal["sequences"][val_mask].astype(np.float32)
+        # Rebuild the stat_threshold score path from scaler.npz instead of
+        # unpickling model.pkl: unpickling re-imports models.lstm_vae -> torch,
+        # which the test interpreter does not have. model.fit and fit_scaler share
+        # the same train-window input and formula, so scaler.npz (mean, std)
+        # reproduces the model's anomaly_score exactly: max|z| over features.
+        scaler = np.load(exp / "scaler.npz")
+        z = np.abs((val_seq - scaler["mean"]) / scaler["std"])
+        val_scores = z.max(axis=-1).max(axis=1)  # stat_threshold, "max" seq aggregation
+        expected = common.threshold_at_fpr(val_scores, common.DEFAULT_TARGET_FPR)
+        self.assertAlmostEqual(threshold, expected, places=4)
+        # the oracle test-set threshold (if recoverable) must differ from the
+        # calibrated one; the report's oracle fields are marked test-only.
+        self.assertLess(report["sequence_level"]["f1_at_threshold"], 1.0)
+
+    def test_deterministic(self):
+        """Same inputs + config -> identical metrics.csv and evaluation report
+        (modulo the per-invocation experiment_id time stamp)."""
+        exp = self.experiments[0]
+        run([VENV_PY, RUN_EXPERIMENT, "--model", "stat_threshold",
+             "--attack-data", self.out / "processed" / "attack",
+             "--normal-data", self.out / "processed" / "normal",
+             "--out", exp.parent], cwd=ROOT)
+        exp2 = sorted(p for p in exp.parent.iterdir() if p.is_dir() and p != exp)[0]
+
+        def load_metrics(path):
+            with open(path, newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            for row in rows:
+                row.pop("experiment_id", None)
+            return rows
+
+        def load_report(path):
+            report = json.loads(path.read_text())
+            report.pop("experiment_id", None)
+            return report
+
+        self.assertEqual(load_metrics(exp / "metrics.csv"),
+                         load_metrics(exp2 / "metrics.csv"))
+        self.assertEqual(load_report(exp / "evaluation_report.json"),
+                         load_report(exp2 / "evaluation_report.json"))
+
+    def test_no_nan_inf_in_metrics(self):
+        metrics = (self.experiments[0] / "metrics.csv").read_text()
+        self.assertNotIn("nan", metrics.lower())
+        self.assertNotIn("inf", metrics.lower())
+
+
+class TestTorchWrapper(unittest.TestCase):
+    """Torch autoencoder adapter (models/torch_ae.py) under the venv interpreter.
+
+    The test runner's python lacks torch, so the check runs as a VENV_PY
+    subprocess against synthetic windows/sequences and asserts the wrapper's
+    contract: shapes, finite scores, train-only scaler, seed determinism, and
+    the score_sequences dispatch.
+    """
+
+    SMOKE = r'''
+import json, os, sys
+sys.path.insert(0, os.path.abspath({root!r}))
+sys.path.insert(0, os.path.join(os.path.abspath({root!r}), "scripts", "train"))
+import numpy as np
+from models.torch_ae import TorchAEWrapper
+from scripts.train import common
+
+rng = np.random.default_rng(0)
+windows = rng.normal(0, 3, size=(300, 90)).astype(np.float32)
+seqs = rng.normal(0, 3, size=(100, 32, 90)).astype(np.float32)
+out = dict()
+
+m = TorchAEWrapper("mlp_ae", seed=7, epochs=2, batch_size=64)
+m.fit(windows)
+s = m.anomaly_score(windows)
+out["mlp_shape"] = list(s.shape)
+out["mlp_finite"] = bool(np.isfinite(s).all()) and float(s.max()) > 0
+mu, sd = common.fit_scaler(windows)
+out["mlp_stats_match"] = bool(np.allclose(m.mean, mu, rtol=1e-6)
+                              and np.allclose(m.std, sd, rtol=1e-6))
+m2 = TorchAEWrapper("mlp_ae", seed=7, epochs=2, batch_size=64)
+m2.fit(windows)
+out["mlp_deterministic"] = bool(np.array_equal(s, m2.anomaly_score(windows)))
+
+la = TorchAEWrapper("lstm_ae", seed=7, epochs=2, seq_batch_size=32)
+la.fit_sequences(seqs)
+sa = la.sequence_anomaly_score(seqs)
+out["lstmae_shape"] = list(sa.shape)
+out["lstmae_finite"] = bool(np.isfinite(sa).all())
+out["lstm_dispatch"] = list(common.score_sequences(la, seqs, "max").shape)
+print(json.dumps(out))
+'''
+
+    def test_torch_wrapper_venv(self):
+        result = subprocess.run([str(VENV_PY), "-c", self.SMOKE.format(root=str(ROOT))],
+                                capture_output=True, text=True, cwd=str(ROOT))
+        self.assertEqual(result.returncode, 0,
+                         f"venv smoke failed:\n{result.stdout}\n{result.stderr}")
+        out = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(out["mlp_shape"], [300])
+        self.assertTrue(out["mlp_finite"])
+        self.assertTrue(out["mlp_stats_match"])
+        self.assertTrue(out["mlp_deterministic"])
+        self.assertEqual(out["lstmae_shape"], [100, 32])
+        self.assertTrue(out["lstmae_finite"])
+        self.assertEqual(out["lstm_dispatch"], [100])
+
+
+if __name__ == "__main__":
+    unittest.main()
