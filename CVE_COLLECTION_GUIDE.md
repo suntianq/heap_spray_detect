@@ -1,45 +1,56 @@
 # 14 个新 CVE 的采集指南
 
 本文档是"在 GPU 服务器上采集 KHeaps 其余 14 个 CVE"的操作指南。基于 2026-08-31 逐 CVE
-源码分析得出。
+源码分析 + 实测验证得出。
 
-## 背景：为什么需要给 PoC 加 marker
+## 背景：marker 机制
 
 检测系统靠 trace_marker（`SPRAY_START`/`SPRAY_END`）标记堆喷时间窗口。采集时
 `validate_trace`（`scripts/collect/collection_common.py:165`）要求恰好一对
-`["SPRAY_START","SPRAY_END"]`。KHeaps 里只有 7308 的 PoC 写了 marker；其余 CVE 需要补。
+`["SPRAY_START","SPRAY_END"]`；`resolve_spray_window` 支持崩溃兜底（crash 时用 last_ts
+当 spray_end，标记 partial）。
 
-**加 marker 的位置**：在堆喷前 `write_trace_marker("SPRAY_START")`，喷完
-`write_trace_marker("SPRAY_END")`。参考 `CVE-2017-7308/poc/poc_cfh_single_spray.c:263,277`。
+**关键发现（2026-08-31 实测）**：`KHeaps/exploit_env/libexp.c` 的所有主流 spray 函数
+**内部自带 marker**：
+- `msg_spray`（libexp.c:459/474）
+- `add_key_spray_num`（libexp.c:384/393）
+- `add_key_desc_spray_num`（libexp.c:410/417）
 
-## 逐 CVE 分类（2026-08-31 源码分析）
+所以**只要 PoC 调用这些函数做 spray，marker 自动就有，无需手动加**。只有用自定义
+spray 的 CVE 才需要手动加 marker。
 
-### ✅ 单次执行（可直接加 marker，推荐）
+## 逐 CVE 分类（2026-08-31 源码分析 + 实测）
 
-这些 CVE 的 exploit 是"一次 spray 即结束"（无外层无限循环），在 spray 前后各加一行
-marker 即可，采集会得到完整窗口。
+### ✅ 无需修改（用 libexp 自带 marker 的 spray 函数）
 
-| CVE | 执行流程 | spray 位置 | 备注 |
-|-----|---------|-----------|------|
-| CVE-2010-2959 | main → trigger() | trigger 内部 | ret2dir 技术 |
-| CVE-2016-0728 | main → exploit() → trigger() | exploit 内部 | refcount 循环但非 spray |
-| CVE-2016-8655 | main → try_exploit() | `add_key_spray_num` (174行) | 崩溃型，sleep 10 后崩 |
-| CVE-2017-10661 | main → do_race() → sleep(5) | do_race 内部 | race 型 |
-| CVE-2017-6074 | main → hijack() | `msg_spray` (363行) | double-free，udp_fifo |
-| CVE-2017-7184 | main → trigger_oob() → hijack() | trigger_oob 内部 | 越界写 |
-| CVE-2017-8824 | main → do_spray() | do_spray 内 add_key (188行) | 单次，简单 |
-| CVE-2017-8890 | main → 线程 server/client → 等结束 | server 线程内 do_spray | 双线程，等 server_finish |
-| CVE-2018-6555 | main → uaf() → trigger() | 内部 | 需确认 spray 在 uaf/trigger 哪个 |
+这些 CVE 的 spray 走 libexp 的 `msg_spray`/`add_key_*`，marker 自动写入，直接采集即可。
 
-### ❌ 循环执行（无法直接加 marker）
+| CVE | spray 函数 | 说明 |
+|-----|-----------|------|
+| CVE-2016-0728 | `msg_spray_max` | exploit 末尾 spray |
+| CVE-2016-8655 | `add_key_spray_num` | 崩溃型 |
+| CVE-2017-6074 | `msg_spray` | double-free |
+| CVE-2017-8824 | `add_key_desc_spray_num` | 已实测：恰好一对 marker ✓ |
+| CVE-2018-6555 | `add_key_desc_spray_num` | uaf 内 spray |
 
-这些 CVE 的 exploit 在 while/for 循环里反复 spray，直接加 marker 会写多对 → 采集时
-`validate_trace` 判 invalid。**需要改造 PoC**（见下方"循环 CVE 的处理"）。
+### ✅ 已手动加 marker（2026-08-31 已改，用自定义 spray）
+
+这 3 个 CVE 的 spray 不走 libexp 自带 marker 函数，我已在 PoC 里加了
+`write_trace_marker("SPRAY_START"/"SPRAY_END")`，已提交。
+
+| CVE | spray 位置 | 说明 |
+|-----|-----------|------|
+| CVE-2010-2959 | `send()` 覆盖相邻对象（ret2dir） | single:197/207, combo 同理 |
+| CVE-2017-7184 | `alloc_victim()` open /proc/buddyinfo | single:417/420 |
+| CVE-2017-8890 | 自定义 `do_spray()`（server 线程内） | single:107/109；线程竞争，partial 有效 |
+
+### ❌ 循环执行（需改造，见下方）
 
 | CVE | 循环结构 |
 |-----|---------|
 | CVE-2016-10150 | `for(int i=0; i<0x100000; i++) trigger()` |
 | CVE-2016-4557 | `while(1) { clean_fork()? exploit() }` |
+| CVE-2017-10661 | `for(int i=0; i<RACE_TIME=8000; i++) { msg_spray }` |
 | CVE-2017-15649 | `for(int j=0; j<1337; j++) { race }` |
 | CVE-2017-7533 | `while(!stop) { open; spray_pipe; check }` |
 
@@ -51,7 +62,7 @@ marker 即可，采集会得到完整窗口。
 
 ## 循环 CVE 的处理（3 种方法）
 
-对 4 个循环 CVE（10150/4557/15649/7533），选择其一：
+对 5 个循环 CVE（10150/4557/10661/15649/7533），选择其一：
 
 1. **限次 + marker**（推荐）：把 `while(1)` 改成有限次数（如 `for(i=0;i<10;i++)`），
    循环**外**包一对 marker（覆盖整个尝试过程）。这样只有一对 marker，采集通过，且
@@ -78,15 +89,20 @@ CVE=<CVE> nohup scripts/collect/collect_cve_complete.sh \
 
 ## 批量采集（多台服务器并行）
 
-14 个 CVE ≈ 40-56 小时/串行。多台服务器并行时，每台分几个 CVE：
+14 个 CVE ≈ 40-56 小时/串行。多台服务器并行时，每台分几个 CVE。
+
+**先采 8 个无需改造的 CVE**（5 个 libexp 自带 marker + 3 个已加 marker）：
 
 ```bash
-# 服务器 A（举例）：单次执行类，先采
-for CVE in CVE-2017-7184 CVE-2017-6074 CVE-2017-8824 CVE-2018-6555; do
+# 服务器 A（举例）
+for CVE in CVE-2017-6074 CVE-2017-8824 CVE-2018-6555 CVE-2016-0728 CVE-2016-8655 \
+           CVE-2010-2959 CVE-2017-7184 CVE-2017-8890; do
   CVE=$CVE nohup scripts/collect/collect_cve_complete.sh > datasets/.m6/logs/collect_$CVE.log 2>&1 &
   # 注意: 同机并行会争 KVM/CPU，建议串行或用不同机器
 done
 ```
+
+**5 个循环 CVE**（10150/4557/10661/15649/7533）需先按上文改造 PoC 再采。
 
 ## 采集后验证
 
