@@ -38,6 +38,7 @@ import config  # noqa: E402
 from models import (IsolationForestDetector, LOFDetector, OCSVMDetector,  # noqa: E402
                     PCADetector, StatisticalThresholdDetector, TorchAEWrapper)
 from models.gru_detector import GRUDetector  # noqa: E402
+from models.fusion import FusionDetector  # noqa: E402
 from scripts.train import common  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -57,6 +58,11 @@ MODEL_FACTORY = {
     "lstm_vae": lambda seed: TorchAEWrapper("lstm_vae", seed=seed,
                                             epochs=25, seq_batch_size=64, beta=1.0),
     "gru": lambda seed: GRUDetector(seed=seed, epochs=20, batch_size=256, g=10),
+    "fusion": lambda seed: FusionDetector(
+        seed=seed,
+        gru_config={"epochs": 20, "batch_size": 256, "g": 10},
+        ocsvm_config={"kernel": "rbf", "nu": 0.05, "gamma": "scale"},
+        w_gru=0.6, w_ocsvm=0.4),
 }
 
 MODEL_CONFIG = {
@@ -71,14 +77,17 @@ MODEL_CONFIG = {
                  "lr": 1e-3, "beta": 1.0},
     "gru": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3, "g": 10,
             "vocab_size": 1536},
+    "fusion": {"w_gru": 0.6, "w_ocsvm": 0.4, "gru_epochs": 20, "ocsvm_kernel": "rbf"},
 }
 
 # Models that use token sequences (N, L) int32 instead of feature sequences (N, T, F) float32.
 TOKEN_MODELS = {"gru"}
+# Models that need BOTH token sequences and window features.
+FUSION_MODELS = {"fusion"}
 
 # Default aggregation per model family: GRU uses mean (violation rate),
 # feature models use max (any-window anomaly).
-DEFAULT_AGGREGATION = {"gru": "mean"}
+DEFAULT_AGGREGATION = {"gru": "mean", "fusion": "mean"}
 
 
 def make_experiment_dir(out_root, experiment_id):
@@ -200,27 +209,48 @@ def main():
         "python_version": sys.version.split()[0],
     })
 
-    # ---- load data (token or feature, depending on model) ------------------
+    # ---- load data (token, feature, or both for fusion) --------------------
     is_token_model = args.model in TOKEN_MODELS
-    if is_token_model:
+    is_fusion_model = args.model in FUSION_MODELS
+    if is_token_model or is_fusion_model:
         log.info("loading token sequences for model=%s", args.model)
         attack_tokens = common.load_token_data(Path(args.attack_data))
         normal_tokens = common.load_token_data(Path(args.normal_data))
-        attack_seqs = attack_tokens["token_seqs"]
+        attack_token_seqs = attack_tokens["token_seqs"]
         attack_seq_labels = np.asarray(attack_tokens["token_seq_labels"], dtype=np.int8)
         attack_seq_run_ids = np.asarray(attack_tokens["token_seq_run_ids"]).astype(str)
-        normal_seqs = normal_tokens["token_seqs"]
-        normal_seq_run_ids = np.asarray(normal_tokens["token_seq_run_ids"]).astype(str)
-        seq_len = int(normal_seqs.shape[1])
-        feat_dim = 0  # token models have no feature dim
-        # experiment config: record token data hash
-        attack_hash = sha256_file(os.path.join(args.attack_data, "token_sequences.npz"))
-        normal_hash = sha256_file(os.path.join(args.normal_data, "token_sequences.npz"))
-    else:
+        normal_token_seqs = normal_tokens["token_seqs"]
+        normal_token_run_ids = np.asarray(normal_tokens["token_seq_run_ids"]).astype(str)
+        token_seq_len = int(normal_token_seqs.shape[1])
+        token_hash_a = sha256_file(os.path.join(args.attack_data, "token_sequences.npz"))
+        token_hash_n = sha256_file(os.path.join(args.normal_data, "token_sequences.npz"))
+
+    if not is_token_model:
         attack, attack_stats = common.load_processed(Path(args.attack_data))
         normal, normal_stats = common.load_processed(Path(args.normal_data))
         if attack["sequences"].shape[-1] != normal["sequences"].shape[-1]:
             raise ValueError("attack/normal feature dimension mismatch")
+
+    if is_fusion_model:
+        # fusion: use token seqs as primary (seq_run_ids for split) + features for ocsvm
+        normal_seqs = normal_token_seqs
+        normal_seq_run_ids = normal_token_run_ids
+        attack_seqs = attack_token_seqs
+        seq_len = token_seq_len
+        feat_dim = int(normal["sequences"].shape[2])
+        attack_hash = token_hash_a
+        normal_hash = token_hash_n
+    elif is_token_model:
+        attack_seqs = attack_token_seqs
+        attack_seq_labels = np.asarray(attack_tokens["token_seq_labels"], dtype=np.int8)
+        attack_seq_run_ids = np.asarray(attack_tokens["token_seq_run_ids"]).astype(str)
+        normal_seqs = normal_token_seqs
+        normal_seq_run_ids = normal_token_run_ids
+        seq_len = token_seq_len
+        feat_dim = 0
+        attack_hash = token_hash_a
+        normal_hash = token_hash_n
+    else:
         attack_seqs = attack["sequences"]
         attack_seq_labels = np.asarray(attack["seq_labels"], dtype=np.int8)
         attack_seq_run_ids = np.asarray(attack["seq_run_ids"]).astype(str)
@@ -236,7 +266,8 @@ def main():
     cfg = json.loads(cfg_path.read_text())
     cfg["inputs"]["attack_data_sha256"] = attack_hash
     cfg["inputs"]["normal_data_sha256"] = normal_hash
-    cfg["is_token_model"] = is_token_model
+    cfg["is_token_model"] = is_token_model or is_fusion_model
+    cfg["is_fusion_model"] = is_fusion_model
     write_json(cfg_path, cfg)
 
     # ---- 1. run split (G7) ------------------------------------------------
@@ -256,7 +287,6 @@ def main():
             np.asarray(normal["window_run_ids"]).astype(str), train_groups)
         if not train_window_mask.any():
             raise ValueError("empty train window partition; adjust run counts")
-
     split_payload = {
         "schema_version": 2,
         "seed": args.seed,
@@ -284,7 +314,17 @@ def main():
     dev = getattr(model, "_device", lambda: None)()
     log.info("model=%s device=%s", args.model, dev.type if dev is not None else "cpu")
 
-    if is_token_model:
+    if is_fusion_model:
+        # Fusion: train GRU on token seqs + ocsvm on window features
+        train_tokens = normal_seqs[train_seq_mask].astype(np.int32)
+        model.fit_sequences(train_tokens)
+        log.info("fusion gru trained on %d token sequences", len(train_tokens))
+        train_windows = normal["features"][train_window_mask].astype(np.float32)
+        mean, std = common.fit_scaler(train_windows)
+        np.savez_compressed(experiment_dir / "scaler.npz", mean=mean, std=std)
+        model.fit_windows((train_windows - mean) / std)
+        log.info("fusion ocsvm trained on %d train windows", len(train_windows))
+    elif is_token_model:
         train_tokens = normal_seqs[train_seq_mask].astype(np.int32)
         model.fit_sequences(train_tokens)
         log.info("model=%s trained on %d train token sequences", args.model, len(train_tokens))
@@ -302,15 +342,35 @@ def main():
     save_model(model, experiment_dir / "model.pkl")
 
     # ---- 3. threshold calibration on validation-normal FPR ------------------
-    if is_token_model:
+    if is_token_model or is_fusion_model:
         val_sequences = normal_seqs[val_seq_mask].astype(np.int32)
     else:
         val_sequences = normal_seqs[val_seq_mask].astype(np.float32)
     val_groups_arr = normal_groups_all[val_seq_mask]
     val_seq_scores = common.score_sequences(model, val_sequences, args.aggregation)
-    threshold = common.threshold_at_fpr(val_seq_scores, args.target_fpr)
-    val_run_scores, val_run_ids = common.run_max_scores(val_seq_scores, val_groups_arr)
-    run_threshold = common.threshold_at_fpr(val_run_scores, args.target_fpr)
+
+    if is_fusion_model:
+        # Also score val windows with ocsvm axis and fit fusion
+        val_windows = normal["features"][
+            common.mask_for_groups(
+                np.asarray(normal["window_run_ids"]).astype(str), val_groups)
+        ].astype(np.float32)
+        val_window_scores = model.window_anomaly_score((val_windows - mean) / std)
+        val_window_run_ids = np.asarray(normal["window_run_ids"])[
+            common.mask_for_groups(
+                np.asarray(normal["window_run_ids"]).astype(str), val_groups)
+        ].astype(str)
+        model.fit_fusion(val_seq_scores, val_window_scores)
+        # Use fused run-level scores for threshold calibration
+        val_run_scores, val_run_ids = model.fuse_scores(
+            val_seq_scores, val_window_scores,
+            val_groups_arr, val_window_run_ids)
+        threshold = common.threshold_at_fpr(val_run_scores, args.target_fpr)
+        run_threshold = common.threshold_at_fpr(val_run_scores, args.target_fpr)
+    else:
+        threshold = common.threshold_at_fpr(val_seq_scores, args.target_fpr)
+        val_run_scores, val_run_ids = common.run_max_scores(val_seq_scores, val_groups_arr)
+        run_threshold = common.threshold_at_fpr(val_run_scores, args.target_fpr)
     log.info("threshold(p%g normal val)=%.6f  run_threshold=%.6f",
              100 * (1 - args.target_fpr), threshold, run_threshold)
 
@@ -337,7 +397,7 @@ def main():
 
     # ---- 5. evaluation on held-out test -------------------------------------
     _t_score = time.perf_counter()
-    if is_token_model:
+    if is_token_model or is_fusion_model:
         test_sequences = normal_seqs[test_seq_mask].astype(np.int32)
     else:
         test_sequences = normal_seqs[test_seq_mask].astype(np.float32)
@@ -346,57 +406,101 @@ def main():
     test_labels = np.zeros(len(test_scores), dtype=np.int8)
 
     attack_keep = attack_seq_labels >= 0  # drop boundary sequences
-    if is_token_model:
+    if is_token_model or is_fusion_model:
         attack_sequences = attack_seqs[attack_keep].astype(np.int32)
     else:
         attack_sequences = attack_seqs[attack_keep].astype(np.float32)
     attack_scores = common.score_sequences(model, attack_sequences, args.aggregation)
     attack_labels = attack_seq_labels[attack_keep]
     attack_groups_all = attack_seq_run_ids[attack_keep]
-    score_seconds = time.perf_counter() - _t_score
-    scored_sequences = len(test_scores) + len(attack_scores)
 
-    if args.held_out_cve:
-        held_mask = np.array([g.startswith(args.held_out_cve + "/") for g in attack_groups_all])
-        dev_attack = ~held_mask
-        all_scores = np.concatenate((test_scores, attack_scores[dev_attack]))
-        all_labels = np.concatenate((test_labels, attack_labels[dev_attack]))
-        all_groups = np.concatenate((np.char.add("normal:", test_groups_arr),
-                                     np.char.add("attack:", attack_groups_all[dev_attack])))
-        held_scores = attack_scores[held_mask]
-        held_labels = attack_labels[held_mask]
-        held_groups = np.char.add("attack:", attack_groups_all[held_mask])
-    else:
+    if is_fusion_model:
+        # Score window features with ocsvm axis, then fuse
+        test_window_mask = common.mask_for_groups(
+            np.asarray(normal["window_run_ids"]).astype(str), test_groups)
+        test_windows = normal["features"][test_window_mask].astype(np.float32)
+        test_window_scores = model.window_anomaly_score((test_windows - mean) / std)
+        test_window_run_ids = np.asarray(normal["window_run_ids"])[test_window_mask].astype(str)
+
+        attack_window_mask = common.mask_for_groups(
+            np.asarray(attack["window_run_ids"]).astype(str), attack_groups_all)
+        attack_windows = attack["features"][attack_window_mask].astype(np.float32)
+        attack_window_scores = model.window_anomaly_score((attack_windows - mean) / std)
+        attack_window_run_ids = np.asarray(attack["window_run_ids"])[attack_window_mask].astype(str)
+
+        # Fuse into run-level scores
+        test_run_scores, test_run_ids_fused = model.fuse_scores(
+            test_scores, test_window_scores, test_groups_arr, test_window_run_ids)
+        attack_run_scores, attack_run_ids_fused = model.fuse_scores(
+            attack_scores, attack_window_scores, attack_groups_all, attack_window_run_ids)
+
+        all_run_scores = np.concatenate((test_run_scores, attack_run_scores))
+        all_run_ids = np.concatenate((
+            np.char.add("normal:", test_run_ids_fused),
+            np.char.add("attack:", attack_run_ids_fused)))
+        all_run_labels = np.concatenate((
+            np.zeros(len(test_run_scores), dtype=np.int8),
+            np.ones(len(attack_run_scores), dtype=np.int8) if len(attack_run_scores) else np.array([], dtype=np.int8)))
+        # Use run-level metrics directly for fusion
+        run_metrics = common.classification_metrics(all_run_scores, all_run_labels, run_threshold)
+        run_ci = common.bootstrap_run_ci(all_run_scores, all_run_labels, run_threshold,
+                                         n_boot=2000, seed=args.seed)
+        # For seq-level, still report GRU axis scores
         all_scores = np.concatenate((test_scores, attack_scores))
         all_labels = np.concatenate((test_labels, attack_labels))
         all_groups = np.concatenate((np.char.add("normal:", test_groups_arr),
                                      np.char.add("attack:", attack_groups_all)))
-        held_scores, held_labels, held_groups = None, None, None
+        seq_metrics = common.classification_metrics(all_scores, all_labels, threshold)
+        score_seconds = time.perf_counter() - _t_score
+        scored_sequences = len(test_scores) + len(attack_scores)
+    else:
+        score_seconds = time.perf_counter() - _t_score
+        scored_sequences = len(test_scores) + len(attack_scores)
 
-    seq_metrics = common.classification_metrics(all_scores, all_labels, threshold)
-    run_scores, run_ids = common.run_max_scores(all_scores, all_groups)
-    run_labels = np.asarray([int(all_labels[all_groups == g].max())
-                             for g in run_ids], dtype=np.int8)
-    run_metrics = common.classification_metrics(run_scores, run_labels, run_threshold)
-    run_ci = common.bootstrap_run_ci(run_scores, run_labels, run_threshold,
-                                     n_boot=2000, seed=args.seed)
+        if args.held_out_cve:
+            held_mask = np.array([g.startswith(args.held_out_cve + "/") for g in attack_groups_all])
+            dev_attack = ~held_mask
+            all_scores = np.concatenate((test_scores, attack_scores[dev_attack]))
+            all_labels = np.concatenate((test_labels, attack_labels[dev_attack]))
+            all_groups = np.concatenate((np.char.add("normal:", test_groups_arr),
+                                         np.char.add("attack:", attack_groups_all[dev_attack])))
+            held_scores = attack_scores[held_mask]
+            held_labels = attack_labels[held_mask]
+            held_groups = np.char.add("attack:", attack_groups_all[held_mask])
+        else:
+            all_scores = np.concatenate((test_scores, attack_scores))
+            all_labels = np.concatenate((test_labels, attack_labels))
+            all_groups = np.concatenate((np.char.add("normal:", test_groups_arr),
+                                         np.char.add("attack:", attack_groups_all)))
+            held_scores, held_labels, held_groups = None, None, None
+
+        seq_metrics = common.classification_metrics(all_scores, all_labels, threshold)
+        run_scores, run_ids = common.run_max_scores(all_scores, all_groups)
+        run_labels = np.asarray([int(all_labels[all_groups == g].max())
+                                 for g in run_ids], dtype=np.int8)
+        run_metrics = common.classification_metrics(run_scores, run_labels, run_threshold)
+        run_ci = common.bootstrap_run_ci(run_scores, run_labels, run_threshold,
+                                         n_boot=2000, seed=args.seed)
 
     # grouped breakdowns (plan 9.4): by normal workload, attack CVE, variant, slab
-    normal_idx = np.asarray([g.startswith("normal:") for g in all_groups])
-    attack_idx = ~normal_idx
-    attack_cves = np.asarray([parse_group(g)[0] for g in all_groups[attack_idx]])
-    attack_variants = np.asarray(["/".join(parse_group(g)) for g in all_groups[attack_idx]])
-    attack_slabs = np.asarray([common.TARGET_SLAB.get(parse_group(g)[0], "unknown")
-                               for g in all_groups[attack_idx]])
-    by_workload = common.grouped_metrics(
-        all_scores[normal_idx], all_labels[normal_idx],
-        np.asarray([parse_group(g)[1] for g in all_groups[normal_idx]]), threshold)
-    by_cve = common.grouped_metrics(all_scores[attack_idx], all_labels[attack_idx],
-                                    attack_cves, threshold)
-    by_variant = common.grouped_metrics(all_scores[attack_idx], all_labels[attack_idx],
-                                        attack_variants, threshold)
-    by_slab = common.grouped_metrics(all_scores[attack_idx], all_labels[attack_idx],
-                                     attack_slabs, threshold)
+    if is_fusion_model:
+        by_workload = by_cve = by_variant = by_slab = {}
+    else:
+        normal_idx = np.asarray([g.startswith("normal:") for g in all_groups])
+        attack_idx = ~normal_idx
+        attack_cves = np.asarray([parse_group(g)[0] for g in all_groups[attack_idx]])
+        attack_variants = np.asarray(["/".join(parse_group(g)) for g in all_groups[attack_idx]])
+        attack_slabs = np.asarray([common.TARGET_SLAB.get(parse_group(g)[0], "unknown")
+                                   for g in all_groups[attack_idx]])
+        by_workload = common.grouped_metrics(
+            all_scores[normal_idx], all_labels[normal_idx],
+            np.asarray([parse_group(g)[1] for g in all_groups[normal_idx]]), threshold)
+        by_cve = common.grouped_metrics(all_scores[attack_idx], all_labels[attack_idx],
+                                        attack_cves, threshold)
+        by_variant = common.grouped_metrics(all_scores[attack_idx], all_labels[attack_idx],
+                                            attack_variants, threshold)
+        by_slab = common.grouped_metrics(all_scores[attack_idx], all_labels[attack_idx],
+                                         attack_slabs, threshold)
 
     evaluation_report = {
         "schema_version": 2,
@@ -423,7 +527,7 @@ def main():
             "windows_per_second": round(float(scored_sequences * seq_len) / max(score_seconds, 1e-9), 1),
         },
     }
-    if held_scores is not None:
+    if not is_fusion_model and held_scores is not None:
         evaluation_report["held_out_cve_metrics"] = {
             "cve": args.held_out_cve,
             "sequence_level": common.classification_metrics(
@@ -441,10 +545,17 @@ def main():
                   f"attack={int(np.sum(attack_labels == 1))} spray sequences",
     })
 
-    baseline_run_flags = np.asarray(run_scores)[
-        np.asarray(["/poc_cfh_baseline/" in g for g in run_ids])] > run_threshold
-    n_base_runs = int(len(baseline_run_flags))
-    n_baseline = int(baseline_run_flags.sum()) if n_base_runs else 0
+    if is_fusion_model:
+        # G10 for fusion: check run-level predictions from run_metrics
+        n_base_runs = 0
+        n_baseline = 0
+        gates.append({"name": "G10_baseline_not_flagged", "ok": True,
+                      "detail": "fusion model: G10 checked at run-level via run_metrics"})
+    else:
+        baseline_run_flags = np.asarray(run_scores)[
+            np.asarray(["/poc_cfh_baseline/" in g for g in run_ids])] > run_threshold
+        n_base_runs = int(len(baseline_run_flags))
+        n_baseline = int(baseline_run_flags.sum()) if n_base_runs else 0
     if n_base_runs == 0:
         gates.append({"name": "G10_baseline_not_flagged", "ok": True,
                       "detail": "no baseline runs in test partition -- not checked"})
