@@ -46,16 +46,16 @@ def write_trace_file(path, lines):
             handle.write(line + "\n")
 
 
-def csv_row(ts_ns, pid, tid, comm, op, ptr, bytes_req, bytes_alloc, call_site):
-    return [ts_ns, pid, tid, comm, op, ptr, bytes_req, bytes_alloc, call_site]
+def csv_row(ts_ns, pid, tid, comm, op, ptr, bytes_req, bytes_alloc, call_site, cpu=0):
+    return [ts_ns, pid, tid, cpu, comm, op, ptr, bytes_req, bytes_alloc, call_site]
 
 
 def write_csv_file(path, rows):
-    """Write rows in the trace2csv.py CSV layout."""
+    """Write rows in the trace2csv.py CSV layout (schema v3, includes cpu column)."""
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with open(path, "w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["timestamp_ns", "pid", "tid", "comm", "op", "ptr",
+        writer.writerow(["timestamp_ns", "pid", "tid", "cpu", "comm", "op", "ptr",
                          "bytes_req", "bytes_alloc", "call_site"])
         writer.writerows(rows)
 

@@ -43,6 +43,7 @@ def parse_ftrace_line(line):
             "timestamp_ns": ts_ns,
             "pid": int(pid),
             "tid": int(pid),
+            "cpu": int(cpu),
             "comm": comm.strip(),
             "op": "ALLOC",
             "ptr": ptr,
@@ -58,6 +59,7 @@ def parse_ftrace_line(line):
             "timestamp_ns": ts_ns,
             "pid": int(pid),
             "tid": int(pid),
+            "cpu": int(cpu),
             "comm": comm.strip(),
             "op": "FREE",
             "ptr": ptr,
@@ -87,6 +89,7 @@ def parse_bpftrace_line(line):
             "timestamp_ns": int(ts),
             "pid": int(pid),
             "tid": int(tid),
+            "cpu": 0,
             "comm": comm.strip(),
             "op": op,
             "ptr": ptr,
@@ -122,7 +125,7 @@ def convert_file(input_path, output_path):
 
     with open(input_path, "r", errors="replace") as fin, open(output_path, "w", newline="") as fout:
         writer = csv.writer(fout)
-        writer.writerow(["timestamp_ns", "pid", "tid", "comm", "op", "ptr",
+        writer.writerow(["timestamp_ns", "pid", "tid", "cpu", "comm", "op", "ptr",
                          "bytes_req", "bytes_alloc", "call_site"])
         for line in fin:
             line = line.strip()
@@ -131,9 +134,9 @@ def convert_file(input_path, output_path):
             rec = parser(line)
             if rec:
                 writer.writerow([
-                    rec["timestamp_ns"], rec["pid"], rec["tid"], rec["comm"],
-                    rec["op"], rec["ptr"], rec["bytes_req"], rec["bytes_alloc"],
-                    rec["call_site"],
+                    rec["timestamp_ns"], rec["pid"], rec["tid"], rec["cpu"],
+                    rec["comm"], rec["op"], rec["ptr"], rec["bytes_req"],
+                    rec["bytes_alloc"], rec["call_site"],
                 ])
                 count += 1
     return count, markers

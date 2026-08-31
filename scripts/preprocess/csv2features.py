@@ -129,6 +129,20 @@ def feature_names():
         "is_empty",
         "time_since_previous_event_ms",
     ])
+    # --- schema v3 extensions (11 dims) ---
+    names.extend([
+        "reclaim_count",
+        "cross_site_reclaim_count",
+        "reclaim_rate",
+        "cpu_alloc_entropy",
+        "top_cpu_alloc_fraction",
+        "lifetime_median",
+        "lifetime_p90",
+        "short_lived_count",
+        "long_lived_count",
+        "burst_dominant_bucket_ratio",
+        "burst_dominant_callsite_ratio",
+    ])
     assert len(names) == config.FEAT_DIM, (len(names), config.FEAT_DIM)
     return names
 
@@ -162,6 +176,25 @@ def feature_groups():
         "is_empty",
         "time_since_previous_event_ms",
     ]
+    groups["v3_reclaim"] = [
+        "reclaim_count",
+        "cross_site_reclaim_count",
+        "reclaim_rate",
+    ]
+    groups["v3_cpu"] = [
+        "cpu_alloc_entropy",
+        "top_cpu_alloc_fraction",
+    ]
+    groups["v3_lifetime"] = [
+        "lifetime_median",
+        "lifetime_p90",
+        "short_lived_count",
+        "long_lived_count",
+    ]
+    groups["v3_burst"] = [
+        "burst_dominant_bucket_ratio",
+        "burst_dominant_callsite_ratio",
+    ]
     flat = [name for group in groups.values() for name in group]
     assert sorted(flat) == sorted(feature_names()), "feature_groups must cover feature_names exactly"
     return groups
@@ -183,6 +216,7 @@ def load_events(csv_path):
                     # and is explicitly marked unknown (plan 5.5).
                     "task_id": int(row.get("tid", row["pid"])),
                     "pid": int(row["pid"]),
+                    "cpu": int(row.get("cpu", 0)),
                     "comm": row.get("comm", ""),
                     "op": row["op"],
                     "ptr": row.get("ptr", ""),
@@ -196,7 +230,7 @@ def load_events(csv_path):
     return events
 
 
-def resolve_free_sizes(events):
+def resolve_free_sizes(events, reclaim_window_ns=50_000_000):
     """Resolve FREE sizes once over the whole trace, preserving causality.
 
     Maintains a ptr -> (size, allocation_timestamp_ns) map. On FREE, annotates
@@ -206,11 +240,18 @@ def resolve_free_sizes(events):
       - allocation_timestamp_ns: when the ptr was allocated
       - object_lifetime_ns: free_ts - alloc_ts (>= 0)
 
+    Additionally tracks reclaim events (schema v3): when an ALLOC reuses a ptr
+    that was FREE'd within reclaim_window_ns, the ALLOC is annotated with
+    reclaim_from_free=True and reclaim_cross_site (if the free and alloc
+    call_sites differ). This captures the UAF free-then-reclaim fingerprint.
+
     Unresolvable frees (unknown ptr or double free) are counted and returned in
     a stats dict so the run can be flagged as a data-quality anomaly.
     """
     live = {}
-    stats = {"alloc_events": 0, "free_events": 0, "resolved": 0, "unresolved": 0}
+    recent_free = {}
+    stats = {"alloc_events": 0, "free_events": 0, "resolved": 0, "unresolved": 0,
+             "reclaim_count": 0, "cross_site_reclaim_count": 0}
     for event in events:
         if event["op"] == "ALLOC":
             size = event["bytes_alloc"] or event["bytes_req"]
@@ -220,11 +261,22 @@ def resolve_free_sizes(events):
             event["allocation_timestamp_ns"] = event["timestamp_ns"]
             event["object_lifetime_ns"] = None
             stats["alloc_events"] += 1
-            if event["ptr"]:
-                live[event["ptr"]] = (size, event["timestamp_ns"])
+            ptr = event["ptr"]
+            if ptr:
+                entry = recent_free.pop(ptr, None)
+                if entry is not None:
+                    free_call_site, free_ts = entry
+                    if event["timestamp_ns"] - free_ts <= reclaim_window_ns:
+                        event["reclaim_from_free"] = True
+                        stats["reclaim_count"] += 1
+                        if free_call_site != event.get("call_site", ""):
+                            event["reclaim_cross_site"] = True
+                            stats["cross_site_reclaim_count"] += 1
+                live[ptr] = (size, event["timestamp_ns"])
         elif event["op"] == "FREE":
             stats["free_events"] += 1
-            entry = live.pop(event["ptr"], None)
+            ptr = event["ptr"]
+            entry = live.pop(ptr, None)
             if entry is None:
                 event["size_resolved"] = False
                 event["resolved_bytes_alloc"] = None
@@ -240,6 +292,8 @@ def resolve_free_sizes(events):
                 event["allocation_timestamp_ns"] = alloc_ts
                 event["object_lifetime_ns"] = max(0, event["timestamp_ns"] - alloc_ts)
                 stats["resolved"] += 1
+            if ptr:
+                recent_free[ptr] = (event.get("call_site", ""), event["timestamp_ns"])
         else:
             event["size_resolved"] = False
     return stats
@@ -282,6 +336,44 @@ def burst_1ms(timestamps, window_start_ns, window_end_ns):
     return float(bins.max())
 
 
+def burst_subwindow_ratios(events, window_start_ns, window_end_ns):
+    """Find the densest 1ms sub-window and return (dominant_bucket_ratio, dominant_callsite_ratio).
+
+    Spray events are sub-millisecond but get diluted in a 100ms window. This
+    finds the 1ms slice with the most events and computes the top1 size-bucket
+    and top1 call_site concentration within that slice -- catching spray
+    concentration that the full-window aggregates average away.
+    """
+    if not events:
+        return 0.0, 0.0
+    sub_ms = 1_000_000
+    n_subs = max(1, int((window_end_ns - window_start_ns) // sub_ms))
+    sub_events = defaultdict(list)
+    for event in events:
+        sub_idx = min(int((event["timestamp_ns"] - window_start_ns) // sub_ms), n_subs - 1)
+        if sub_idx < 0:
+            sub_idx = 0
+        sub_events[sub_idx].append(event)
+    if not sub_events:
+        return 0.0, 0.0
+    densest_idx = max(sub_events, key=lambda k: len(sub_events[k]))
+    densest = sub_events[densest_idx]
+    if not densest:
+        return 0.0, 0.0
+    bucket_counts = Counter()
+    callsite_counts = Counter()
+    for event in densest:
+        if event["op"] == "ALLOC":
+            bucket_counts[bucket_index(event["resolved_size"] or 0)] += 1
+            callsite_counts[event["call_site"]] += 1
+    total = sum(bucket_counts.values())
+    if total == 0:
+        return 0.0, 0.0
+    dominant_bucket_ratio = bucket_counts.most_common(1)[0][1] / total if bucket_counts else 0.0
+    dominant_callsite_ratio = callsite_counts.most_common(1)[0][1] / total if callsite_counts else 0.0
+    return float(dominant_bucket_ratio), float(dominant_callsite_ratio)
+
+
 def extract_features_from_events(events, window_ms, window_start_ns, previous_event_ns=None):
     bucket_count = len(BUCKET_LABELS)
     alloc_counts = np.zeros(bucket_count, dtype=np.float64)
@@ -294,6 +386,10 @@ def extract_features_from_events(events, window_ms, window_start_ns, previous_ev
     task_comms = defaultdict(Counter)
     alloc_times, free_times = [], []
     unknown_frees = 0
+    reclaim_count = 0
+    cross_site_reclaim_count = 0
+    cpu_alloc_counts = Counter()
+    lifetimes_us = []
 
     for event in events:
         task_id = event["task_id"]
@@ -305,6 +401,11 @@ def extract_features_from_events(events, window_ms, window_start_ns, previous_ev
             alloc_call_sites[event["call_site"]] += 1
             alloc_times.append(event["timestamp_ns"])
             task_alloc_times[task_id].append(event["timestamp_ns"])
+            cpu_alloc_counts[event.get("cpu", 0)] += 1
+            if event.get("reclaim_from_free", False):
+                reclaim_count += 1
+                if event.get("reclaim_cross_site", False):
+                    cross_site_reclaim_count += 1
         elif event["op"] == "FREE":
             free_times.append(event["timestamp_ns"])
             free_call_sites[event["call_site"]] += 1
@@ -314,6 +415,9 @@ def extract_features_from_events(events, window_ms, window_start_ns, previous_ev
                 index = bucket_index(event["resolved_bytes_alloc"])
                 free_counts[index] += 1
                 task_free_counts[task_id][index] += 1
+            lt_ns = event.get("object_lifetime_ns")
+            if lt_ns is not None and lt_ns >= 0:
+                lifetimes_us.append(lt_ns / 1_000.0)
 
     total_alloc = len(alloc_times)
     total_free = len(free_times)
@@ -341,6 +445,24 @@ def extract_features_from_events(events, window_ms, window_start_ns, previous_ev
         since_previous_ms = duration_ms
     else:
         since_previous_ms = min(max((window_start_ns - previous_event_ns) / 1e6, 0.0), 60_000.0)
+
+    cpu_entropy = normalized_entropy(cpu_alloc_counts)
+    top_cpu_fraction = (cpu_alloc_counts.most_common(1)[0][1] / max(total_alloc, 1)
+                        if cpu_alloc_counts else 0.0)
+
+    if lifetimes_us:
+        lt_arr = np.array(lifetimes_us, dtype=np.float64)
+        lifetime_median = float(np.median(lt_arr)) / 1000.0
+        lifetime_p90 = float(np.percentile(lt_arr, 90)) / 1000.0
+        short_lived = int(np.sum(lt_arr < 1000.0))
+    else:
+        lifetime_median = 0.0
+        lifetime_p90 = 0.0
+        short_lived = 0
+    long_lived = max(0, total_alloc - total_free)
+
+    burst_bucket_ratio, burst_callsite_ratio = burst_subwindow_ratios(
+        events, window_start_ns, window_end_ns)
 
     values = []
     values.extend(alloc_counts)
@@ -370,6 +492,20 @@ def extract_features_from_events(events, window_ms, window_start_ns, previous_ev
         float(len(events)),
         float(not events),
         float(since_previous_ms),
+    ])
+    # --- schema v3 extensions (11 dims) ---
+    values.extend([
+        float(reclaim_count),
+        float(cross_site_reclaim_count),
+        reclaim_count / max(total_alloc, 1),
+        cpu_entropy,
+        top_cpu_fraction,
+        lifetime_median,
+        lifetime_p90,
+        float(short_lived),
+        float(long_lived),
+        burst_bucket_ratio,
+        burst_callsite_ratio,
     ])
     result = sanitize_feature_vector(values)
     assert len(result) == config.FEAT_DIM, (len(result), config.FEAT_DIM)

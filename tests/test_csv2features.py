@@ -76,6 +76,42 @@ class TestResolveFreeSizes(unittest.TestCase):
         self.assertEqual(events[1]["resolved_bytes_alloc"], 256)
         self.assertEqual(events[3]["resolved_bytes_alloc"], 512)  # new allocation wins
 
+    def test_reclaim_detection(self):
+        """ALLOC reusing a recently-freed ptr within the window is a reclaim."""
+        events = [
+            {"op": "ALLOC", "ptr": "0x100", "bytes_alloc": 256, "bytes_req": 0,
+             "timestamp_ns": 1_000_000, "call_site": "cs_x"},
+            {"op": "FREE", "ptr": "0x100", "bytes_alloc": 0, "bytes_req": 0,
+             "timestamp_ns": 2_000_000, "call_site": "cs_x"},
+            {"op": "ALLOC", "ptr": "0x100", "bytes_alloc": 256, "bytes_req": 0,
+             "timestamp_ns": 3_000_000, "call_site": "cs_x"},  # same-site reclaim
+            {"op": "FREE", "ptr": "0x100", "bytes_alloc": 0, "bytes_req": 0,
+             "timestamp_ns": 4_000_000, "call_site": "cs_y"},
+            {"op": "ALLOC", "ptr": "0x100", "bytes_alloc": 256, "bytes_req": 0,
+             "timestamp_ns": 5_000_000, "call_site": "cs_z"},  # cross-site reclaim
+        ]
+        stats = c2f.resolve_free_sizes(events)
+        self.assertEqual(stats["reclaim_count"], 2)
+        self.assertEqual(stats["cross_site_reclaim_count"], 1)
+        self.assertTrue(events[2].get("reclaim_from_free"))
+        self.assertFalse(events[2].get("reclaim_cross_site", False))
+        self.assertTrue(events[4].get("reclaim_from_free"))
+        self.assertTrue(events[4].get("reclaim_cross_site"))
+
+    def test_reclaim_outside_window_not_counted(self):
+        """Reclaim beyond reclaim_window_ns is not counted."""
+        events = [
+            {"op": "ALLOC", "ptr": "0x100", "bytes_alloc": 256, "bytes_req": 0,
+             "timestamp_ns": 0, "call_site": "cs_alloc"},
+            {"op": "FREE", "ptr": "0x100", "bytes_alloc": 0, "bytes_req": 0,
+             "timestamp_ns": 1_000_000, "call_site": "cs_free"},
+            # 100ms later = 100_000_000 ns, beyond 50ms window
+            {"op": "ALLOC", "ptr": "0x100", "bytes_alloc": 256, "bytes_req": 0,
+             "timestamp_ns": 101_000_000, "call_site": "cs_alloc2"},
+        ]
+        stats = c2f.resolve_free_sizes(events)
+        self.assertEqual(stats["reclaim_count"], 0)
+
 
 class TestFixedWindows(unittest.TestCase):
     def test_empty_windows_preserved(self):
@@ -119,6 +155,108 @@ class TestFixedWindows(unittest.TestCase):
             idx = c2f.feature_names().index("alloc_rate_32")
             # features are stored as float32; compare with tolerance
             self.assertAlmostEqual(float(features[0, idx]), 2.0 / 100.0, places=6)
+
+
+class TestV3Features(unittest.TestCase):
+    """Tests for schema v3 extension features: reclaim, cpu, lifetime, burst."""
+
+    def test_cpu_concentration(self):
+        """All allocs on CPU 0 -> top_cpu_fraction=1.0, cpu_entropy=0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "trace.csv")
+            rows = []
+            for i in range(10):
+                rows.append(csv_row(i * 1_000_000, 1, 1, "bash", "ALLOC",
+                                    f"{0x1000+i:016x}", 32, 32, "ffffffff8139c7f1", cpu=0))
+            write_csv_file(path, rows)
+            features, *_ = c2f.process_csv(path, 100, 50)
+            names = c2f.feature_names()
+            cpu_frac = float(features[0, names.index("top_cpu_alloc_fraction")])
+            cpu_ent = float(features[0, names.index("cpu_alloc_entropy")])
+            self.assertAlmostEqual(cpu_frac, 1.0, places=5)
+            self.assertAlmostEqual(cpu_ent, 0.0, places=5)
+
+    def test_cpu_spread(self):
+        """Allocs spread across 4 CPUs -> high entropy, low top fraction."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "trace.csv")
+            rows = []
+            for i in range(8):
+                rows.append(csv_row(i * 1_000_000, 1, 1, "bash", "ALLOC",
+                                    f"{0x1000+i:016x}", 32, 32, "ffffffff8139c7f1", cpu=i % 4))
+            write_csv_file(path, rows)
+            features, *_ = c2f.process_csv(path, 100, 50)
+            names = c2f.feature_names()
+            cpu_frac = float(features[0, names.index("top_cpu_alloc_fraction")])
+            cpu_ent = float(features[0, names.index("cpu_alloc_entropy")])
+            self.assertAlmostEqual(cpu_frac, 0.25, places=4)  # 2/8 per CPU
+            self.assertGreater(cpu_ent, 0.9)  # near-max entropy for 4 CPUs
+
+    def test_lifetime_features(self):
+        """Short-lived objects produce low median, high short_lived_count."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "trace.csv")
+            rows = []
+            # 5 objects: alloc at t=0,1,2,3,4ms; free at t=0.5,1.5,2.5,3.5,4.5ms
+            for i in range(5):
+                ptr = f"{0x1000+i:016x}"
+                rows.append(csv_row(i * 1_000_000, 1, 1, "bash", "ALLOC", ptr, 32, 32,
+                                    "ffffffff8139c7f1"))
+                rows.append(csv_row(i * 1_000_000 + 500_000, 1, 1, "bash", "FREE", ptr, 0, 0,
+                                    "ffffffff8136ccd1"))
+            write_csv_file(path, rows)
+            features, *_ = c2f.process_csv(path, 100, 50)
+            names = c2f.feature_names()
+            short_lived = float(features[0, names.index("short_lived_count")])
+            lifetime_median = float(features[0, names.index("lifetime_median")])
+            self.assertEqual(int(short_lived), 5)  # all < 1ms (500us)
+            self.assertLess(lifetime_median, 1.0)  # median 0.5ms
+
+    def test_burst_concentration(self):
+        """Dense 1ms sub-window with single call_site -> high burst ratio."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "trace.csv")
+            rows = []
+            # 50 allocs within 0.5ms (burst), all same call_site and size
+            for i in range(50):
+                rows.append(csv_row(i * 10_000, 1, 1, "spray", "ALLOC",
+                                    f"{0x2000+i:016x}", 256, 256, "ffffffff818025d9", cpu=0))
+            # A few scattered background allocs
+            for i in range(5):
+                rows.append(csv_row(50_000_000 + i * 5_000_000, 2, 2, "bg", "ALLOC",
+                                    f"{0x3000+i:016x}", 64, 64, "ffffffff8139dcc0", cpu=1))
+            write_csv_file(path, rows)
+            features, *_ = c2f.process_csv(path, 100, 50)
+            names = c2f.feature_names()
+            burst_cs = float(features[0, names.index("burst_dominant_callsite_ratio")])
+            burst_bk = float(features[0, names.index("burst_dominant_bucket_ratio")])
+            self.assertGreater(burst_cs, 0.9)  # densest 1ms is all spray call_site
+            self.assertGreater(burst_bk, 0.9)  # all bucket 256
+
+    def test_reclaim_features_in_window(self):
+        """Reclaim events within a window are counted in features."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "trace.csv")
+            rows = []
+            # alloc ptr=0x100, free it, then re-alloc same ptr (reclaim)
+            rows.append(csv_row(1_000_000, 1, 1, "bash", "ALLOC", "0000000000000100",
+                                256, 256, "ffffffff8139c7f1"))
+            rows.append(csv_row(2_000_000, 1, 1, "bash", "FREE", "0000000000000100",
+                                0, 0, "ffffffff8136ccd1"))
+            rows.append(csv_row(3_000_000, 1, 1, "bash", "ALLOC", "0000000000000100",
+                                256, 256, "ffffffff8139c7e1"))  # cross-site reclaim
+            write_csv_file(path, rows)
+            features, *_ = c2f.process_csv(path, 100, 50)
+            names = c2f.feature_names()
+            reclaim = float(features[0, names.index("reclaim_count")])
+            cross_site = float(features[0, names.index("cross_site_reclaim_count")])
+            self.assertEqual(int(reclaim), 1)
+            self.assertEqual(int(cross_site), 1)
+
+    def test_feature_dim_matches_config(self):
+        self.assertEqual(len(c2f.feature_names()), config.FEAT_DIM)
+        self.assertEqual(config.FEAT_DIM, 101)
+        self.assertEqual(config.DATASET_SCHEMA_VERSION, 3)
 
 
 class TestWindowLabel(unittest.TestCase):
@@ -312,7 +450,7 @@ class TestEndToEnd(unittest.TestCase):
 
             data_a = np.load(os.path.join(out_a, "features.npz"), allow_pickle=True)
             data_n = np.load(os.path.join(out_n, "features.npz"), allow_pickle=True)
-            self.assertEqual(data_a["schema_version"], 2)
+            self.assertEqual(data_a["schema_version"], 3)
             self.assertEqual(data_a["features"].shape[1], config.FEAT_DIM)
             self.assertTrue((data_a["labels"] >= -1).all() and (data_a["labels"] <= 1).all())
             # attack run must contain attack windows

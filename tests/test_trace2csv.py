@@ -20,12 +20,13 @@ from synthetic import (bpftrace_line, kfree_line, kmalloc_line, marker_line,
 
 class TestFtraceParsing(unittest.TestCase):
     def test_parse_kmalloc(self):
-        line = kmalloc_line("bash", 1858, 11_852_213_000, 0x688bb814, 32, 32)
+        line = kmalloc_line("bash", 1858, 11_852_213_000, 0x688bb814, 32, 32, cpu=3)
         rec = trace2csv.parse_ftrace_line(line)
         self.assertIsNotNone(rec)
         self.assertEqual(rec["timestamp_ns"], 11_852_213_000)
         self.assertEqual(rec["pid"], 1858)
         self.assertEqual(rec["tid"], 1858)
+        self.assertEqual(rec["cpu"], 3)
         self.assertEqual(rec["comm"], "bash")
         self.assertEqual(rec["op"], "ALLOC")
         self.assertEqual(rec["ptr"], "00000000688bb814")
@@ -34,9 +35,10 @@ class TestFtraceParsing(unittest.TestCase):
         self.assertIn("ffffffff8139c7f1", rec["call_site"])
 
     def test_parse_kfree(self):
-        line = kfree_line("bash", 1858, 11_852_213_000, 0x688bb814)
+        line = kfree_line("bash", 1858, 11_852_213_000, 0x688bb814, cpu=2)
         rec = trace2csv.parse_ftrace_line(line)
         self.assertIsNotNone(rec)
+        self.assertEqual(rec["cpu"], 2)
         self.assertEqual(rec["op"], "FREE")
         self.assertEqual(rec["ptr"], "00000000688bb814")
 
@@ -47,6 +49,7 @@ class TestFtraceParsing(unittest.TestCase):
         self.assertEqual(rec["timestamp_ns"], 11_852_213_000)
         self.assertEqual(rec["pid"], 100)
         self.assertEqual(rec["tid"], 100)
+        self.assertEqual(rec["cpu"], 0)
         self.assertEqual(rec["op"], "ALLOC")
         self.assertEqual(rec["bytes_req"], 64)
         self.assertEqual(rec["bytes_alloc"], 128)

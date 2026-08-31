@@ -31,8 +31,8 @@ DEFAULT_TARGET_FPR = 0.01  # threshold = 99th percentile of validation-normal sc
 def load_processed(proc_dir):
     """Load a processed dataset (features.npz + stats.json) into a dict."""
     data = np.load(str(proc_dir / "features.npz"), allow_pickle=True)
-    if int(data.get("schema_version", 1)) < 2:
-        raise ValueError(f"schema-v2 dataset required: {proc_dir}")
+    if int(data.get("schema_version", 1)) < 3:
+        raise ValueError(f"schema-v3 dataset required (has {data.get('schema_version', '?')}): {proc_dir}")
     with (proc_dir / "stats.json").open() as handle:
         stats = json.load(handle)
     return data, stats
