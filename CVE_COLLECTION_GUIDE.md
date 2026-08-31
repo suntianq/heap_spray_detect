@@ -91,18 +91,20 @@ CVE=<CVE> nohup scripts/collect/collect_cve_complete.sh \
 
 14 个 CVE ≈ 40-56 小时/串行。多台服务器并行时，每台分几个 CVE。
 
-**先采 8 个无需改造的 CVE**（5 个 libexp 自带 marker + 3 个已加 marker）：
+**8 个无需改造的 CVE 直接跑批量脚本**（`collect_all_cves.sh`，逐个串行、可续跑）：
 
 ```bash
-# 服务器 A（举例）
-for CVE in CVE-2017-6074 CVE-2017-8824 CVE-2018-6555 CVE-2016-0728 CVE-2016-8655 \
-           CVE-2010-2959 CVE-2017-7184 CVE-2017-8890; do
-  CVE=$CVE nohup scripts/collect/collect_cve_complete.sh > datasets/.m6/logs/collect_$CVE.log 2>&1 &
-  # 注意: 同机并行会争 KVM/CPU，建议串行或用不同机器
-done
+# 服务器上直接运行（8 个 CVE 依次采集，每 CVE 3-4 小时，总约 24-32 小时）
+nohup scripts/collect/collect_all_cves.sh \
+    > datasets/.m6/logs/collect_all_cves.log 2>&1 &
+# 可选环境变量: CVES="..." MIN_VALID=15 NORMAL_RUNS=20 COLLECT_DURATION=30
 ```
 
-**5 个循环 CVE**（10150/4557/10661/15649/7533）需先按上文改造 PoC 再采。
+脚本逐个串行（避免争 KVM/CPU），每 CVE 独立日志 `datasets/.m6/logs/collect_<CVE>_complete.log`，
+完成后打 `collect_<CVE>_complete.done` 标记——**重跑自动跳过已完成的 CVE**，失败 CVE 末尾汇总报告。
+
+**5 个循环 CVE**（10150/4557/10661/15649/7533）需先按上文改造 PoC，然后可把 CVE 加入
+`CVES` 环境变量再跑同一个脚本。
 
 ## 采集后验证
 
