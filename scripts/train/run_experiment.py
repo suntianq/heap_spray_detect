@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import config  # noqa: E402
 from models import (IsolationForestDetector, LOFDetector, OCSVMDetector,  # noqa: E402
                     PCADetector, StatisticalThresholdDetector, TorchAEWrapper)
+from models.gru_detector import GRUDetector  # noqa: E402
 from scripts.train import common  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -55,6 +56,7 @@ MODEL_FACTORY = {
                                            epochs=25, seq_batch_size=64),
     "lstm_vae": lambda seed: TorchAEWrapper("lstm_vae", seed=seed,
                                             epochs=25, seq_batch_size=64, beta=1.0),
+    "gru": lambda seed: GRUDetector(seed=seed, epochs=20, batch_size=256, g=10),
 }
 
 MODEL_CONFIG = {
@@ -67,7 +69,16 @@ MODEL_CONFIG = {
     "lstm_ae": {"hidden_dim": 64, "latent_dim": 16, "num_layers": 2, "epochs": 25, "lr": 1e-3},
     "lstm_vae": {"hidden_dim": 64, "latent_dim": 16, "num_layers": 2, "epochs": 25,
                  "lr": 1e-3, "beta": 1.0},
+    "gru": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3, "g": 10,
+            "vocab_size": 1536},
 }
+
+# Models that use token sequences (N, L) int32 instead of feature sequences (N, T, F) float32.
+TOKEN_MODELS = {"gru"}
+
+# Default aggregation per model family: GRU uses mean (violation rate),
+# feature models use max (any-window anomaly).
+DEFAULT_AGGREGATION = {"gru": "mean"}
 
 
 def make_experiment_dir(out_root, experiment_id):
@@ -147,11 +158,14 @@ def main():
     parser.add_argument("--val-fraction", type=float, default=common.DEFAULT_VAL_FRACTION)
     parser.add_argument("--test-fraction", type=float, default=common.DEFAULT_TEST_FRACTION)
     parser.add_argument("--target-fpr", type=float, default=common.DEFAULT_TARGET_FPR)
-    parser.add_argument("--aggregation", choices=["max", "last", "p90"], default="max",
-                        help="sequence score aggregation; pilot uses 'any' sequence labels -> max")
+    parser.add_argument("--aggregation", choices=["max", "last", "p90", "mean"], default=None,
+                        help="sequence score aggregation; default per model (gru=mean, others=max)")
     parser.add_argument("--held-out-cve", default=None,
                         help="leave-one-CVE-out: exclude this CVE's attack from aggregate eval")
     args = parser.parse_args()
+
+    if args.aggregation is None:
+        args.aggregation = DEFAULT_AGGREGATION.get(args.model, "max")
 
     if args.val_fraction + args.test_fraction >= 0.5:
         parser.error("val+test fractions must be < 0.5")
@@ -181,32 +195,67 @@ def main():
         "inputs": {
             "attack_data": args.attack_data,
             "normal_data": args.normal_data,
-            "attack_features_sha256": sha256_file(os.path.join(args.attack_data, "features.npz")),
-            "normal_features_sha256": sha256_file(os.path.join(args.normal_data, "features.npz")),
         },
         "git_revision": git_revision(),
         "python_version": sys.version.split()[0],
     })
 
-    attack, attack_stats = common.load_processed(Path(args.attack_data))
-    normal, normal_stats = common.load_processed(Path(args.normal_data))
-    if attack["sequences"].shape[-1] != normal["sequences"].shape[-1]:
-        raise ValueError("attack/normal feature dimension mismatch")
+    # ---- load data (token or feature, depending on model) ------------------
+    is_token_model = args.model in TOKEN_MODELS
+    if is_token_model:
+        log.info("loading token sequences for model=%s", args.model)
+        attack_tokens = common.load_token_data(Path(args.attack_data))
+        normal_tokens = common.load_token_data(Path(args.normal_data))
+        attack_seqs = attack_tokens["token_seqs"]
+        attack_seq_labels = np.asarray(attack_tokens["token_seq_labels"], dtype=np.int8)
+        attack_seq_run_ids = np.asarray(attack_tokens["token_seq_run_ids"]).astype(str)
+        normal_seqs = normal_tokens["token_seqs"]
+        normal_seq_run_ids = np.asarray(normal_tokens["token_seq_run_ids"]).astype(str)
+        seq_len = int(normal_seqs.shape[1])
+        feat_dim = 0  # token models have no feature dim
+        # experiment config: record token data hash
+        attack_hash = sha256_file(os.path.join(args.attack_data, "token_sequences.npz"))
+        normal_hash = sha256_file(os.path.join(args.normal_data, "token_sequences.npz"))
+    else:
+        attack, attack_stats = common.load_processed(Path(args.attack_data))
+        normal, normal_stats = common.load_processed(Path(args.normal_data))
+        if attack["sequences"].shape[-1] != normal["sequences"].shape[-1]:
+            raise ValueError("attack/normal feature dimension mismatch")
+        attack_seqs = attack["sequences"]
+        attack_seq_labels = np.asarray(attack["seq_labels"], dtype=np.int8)
+        attack_seq_run_ids = np.asarray(attack["seq_run_ids"]).astype(str)
+        normal_seqs = normal["sequences"]
+        normal_seq_run_ids = np.asarray(normal["seq_run_ids"]).astype(str)
+        seq_len = int(normal_seqs.shape[1])
+        feat_dim = int(normal_seqs.shape[2])
+        attack_hash = sha256_file(os.path.join(args.attack_data, "features.npz"))
+        normal_hash = sha256_file(os.path.join(args.normal_data, "features.npz"))
 
-    seq_len = int(normal["sequences"].shape[1])
-    feat_dim = int(normal["sequences"].shape[2])
+    # update experiment config with actual hashes
+    cfg_path = experiment_dir / "experiment_config.json"
+    cfg = json.loads(cfg_path.read_text())
+    cfg["inputs"]["attack_data_sha256"] = attack_hash
+    cfg["inputs"]["normal_data_sha256"] = normal_hash
+    cfg["is_token_model"] = is_token_model
+    write_json(cfg_path, cfg)
 
     # ---- 1. run split (G7) ------------------------------------------------
-    normal_groups_all = np.asarray(normal["seq_run_ids"]).astype(str)
+    normal_groups_all = normal_seq_run_ids
     train_groups, val_groups, test_groups = common.split_run_groups(
         normal_groups_all, args.seed, args.val_fraction, args.test_fraction)
     train_seq_mask = common.mask_for_groups(normal_groups_all, train_groups)
     val_seq_mask = common.mask_for_groups(normal_groups_all, val_groups)
     test_seq_mask = common.mask_for_groups(normal_groups_all, test_groups)
-    train_window_mask = common.mask_for_groups(
-        np.asarray(normal["window_run_ids"]).astype(str), train_groups)
-    if not all(m.any() for m in (train_seq_mask, val_seq_mask, test_seq_mask, train_window_mask)):
+    if not all(m.any() for m in (train_seq_mask, val_seq_mask, test_seq_mask)):
         raise ValueError("empty partition; adjust run counts")
+
+    # window mask only for feature models (token models have no windows)
+    train_window_mask = None
+    if not is_token_model:
+        train_window_mask = common.mask_for_groups(
+            np.asarray(normal["window_run_ids"]).astype(str), train_groups)
+        if not train_window_mask.any():
+            raise ValueError("empty train window partition; adjust run counts")
 
     split_payload = {
         "schema_version": 2,
@@ -230,25 +279,33 @@ def main():
                   f"runs, pairwise-disjoint={g7_ok}",
     }]
 
-    # ---- 2. scaler + model fit on train windows only -----------------------
-    train_windows = normal["features"][train_window_mask].astype(np.float32)
-    mean, std = common.fit_scaler(train_windows)
-    np.savez_compressed(experiment_dir / "scaler.npz", mean=mean, std=std)
-
+    # ---- 2. scaler + model fit (token models skip scaler) ------------------
     model = MODEL_FACTORY[args.model](args.seed)
     dev = getattr(model, "_device", lambda: None)()
     log.info("model=%s device=%s", args.model, dev.type if dev is not None else "cpu")
-    if getattr(model, "sequence_model", False):
-        train_sequences = normal["sequences"][train_seq_mask].astype(np.float32)
-        model.fit_sequences(train_sequences)
-        log.info("model=%s trained on %d train sequences", args.model, len(train_sequences))
+
+    if is_token_model:
+        train_tokens = normal_seqs[train_seq_mask].astype(np.int32)
+        model.fit_sequences(train_tokens)
+        log.info("model=%s trained on %d train token sequences", args.model, len(train_tokens))
     else:
-        model.fit(train_windows)
-        log.info("model=%s trained on %d train windows", args.model, len(train_windows))
+        train_windows = normal["features"][train_window_mask].astype(np.float32)
+        mean, std = common.fit_scaler(train_windows)
+        np.savez_compressed(experiment_dir / "scaler.npz", mean=mean, std=std)
+        if getattr(model, "sequence_model", False):
+            train_sequences = normal_seqs[train_seq_mask].astype(np.float32)
+            model.fit_sequences(train_sequences)
+            log.info("model=%s trained on %d train sequences", args.model, len(train_sequences))
+        else:
+            model.fit(train_windows)
+            log.info("model=%s trained on %d train windows", args.model, len(train_windows))
     save_model(model, experiment_dir / "model.pkl")
 
     # ---- 3. threshold calibration on validation-normal FPR ------------------
-    val_sequences = normal["sequences"][val_seq_mask].astype(np.float32)
+    if is_token_model:
+        val_sequences = normal_seqs[val_seq_mask].astype(np.int32)
+    else:
+        val_sequences = normal_seqs[val_seq_mask].astype(np.float32)
     val_groups_arr = normal_groups_all[val_seq_mask]
     val_seq_scores = common.score_sequences(model, val_sequences, args.aggregation)
     threshold = common.threshold_at_fpr(val_seq_scores, args.target_fpr)
@@ -271,8 +328,8 @@ def main():
         "run_threshold": run_threshold,
         "val_normal_sequences": int(len(val_seq_scores)),
         "val_normal_runs": int(len(val_run_scores)),
-        "scaler_fit_on": "train_runs_only",
-        "scaler_npz": "scaler.npz",
+        "scaler_fit_on": "none (token model)" if is_token_model else "train_runs_only",
+        "scaler_npz": "none (token model)" if is_token_model else "scaler.npz",
         "seed": args.seed,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -280,17 +337,22 @@ def main():
 
     # ---- 5. evaluation on held-out test -------------------------------------
     _t_score = time.perf_counter()
-    test_sequences = normal["sequences"][test_seq_mask].astype(np.float32)
+    if is_token_model:
+        test_sequences = normal_seqs[test_seq_mask].astype(np.int32)
+    else:
+        test_sequences = normal_seqs[test_seq_mask].astype(np.float32)
     test_groups_arr = normal_groups_all[test_seq_mask]
     test_scores = common.score_sequences(model, test_sequences, args.aggregation)
     test_labels = np.zeros(len(test_scores), dtype=np.int8)
 
-    attack_seq_labels = np.asarray(attack["seq_labels"], dtype=np.int8)
-    attack_keep = attack_seq_labels >= 0  # drop boundary sequences (plan 5.6)
-    attack_sequences = attack["sequences"][attack_keep].astype(np.float32)
+    attack_keep = attack_seq_labels >= 0  # drop boundary sequences
+    if is_token_model:
+        attack_sequences = attack_seqs[attack_keep].astype(np.int32)
+    else:
+        attack_sequences = attack_seqs[attack_keep].astype(np.float32)
     attack_scores = common.score_sequences(model, attack_sequences, args.aggregation)
     attack_labels = attack_seq_labels[attack_keep]
-    attack_groups_all = np.asarray(attack["seq_run_ids"]).astype(str)[attack_keep]
+    attack_groups_all = attack_seq_run_ids[attack_keep]
     score_seconds = time.perf_counter() - _t_score
     scored_sequences = len(test_scores) + len(attack_scores)
 

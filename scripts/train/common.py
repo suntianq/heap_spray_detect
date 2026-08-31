@@ -38,6 +38,20 @@ def load_processed(proc_dir):
     return data, stats
 
 
+def load_token_data(proc_dir):
+    """Load token_sequences.npz for event-level models (GRU).
+
+    Returns a dict-like npz with keys: token_seqs, token_seq_run_ids,
+    token_seq_labels. Falls back to features.npz run_ids for splitting
+    when token data is unavailable (e.g. legacy datasets).
+    """
+    token_path = proc_dir / "token_sequences.npz"
+    if not token_path.exists():
+        raise FileNotFoundError(f"token_sequences.npz not found in {proc_dir}")
+    data = np.load(str(token_path), allow_pickle=True)
+    return data
+
+
 def run_stratum(run_id):
     """Stratum key for a run id: the workload/variant path minus the run index.
 
@@ -102,6 +116,8 @@ def aggregate_scores(per_window, aggregation):
         return per_window.max(axis=1)
     if aggregation == "p90":
         return np.percentile(per_window, 90, axis=1)
+    if aggregation == "mean":
+        return per_window.mean(axis=1)
     raise ValueError(f"unknown score aggregation: {aggregation}")
 
 
@@ -111,21 +127,23 @@ def score_windows(model, windows):
 
 
 def score_sequences(model, sequences, aggregation):
-    """Score (N, T, F) sequences, aggregating per-sequence window scores.
+    """Score sequences, aggregating per-sequence position scores.
 
-    Sequence models (e.g. LSTM autoencoders) need the full temporal context to
-    score each window, so they expose sequence_anomaly_score((N,T,F)) -> (N,T)
-    and bypass the window-reshape path; window models reuse score_windows.
+    Works with both feature sequences (N, T, F) float32 and token sequences
+    (N, L) int32. Sequence models expose sequence_anomaly_score which returns
+    per-position scores; window models reuse score_windows via reshape.
+
+    For token models (GRU), sequences is (N, L) int32 and
+    sequence_anomaly_score returns (N, L) per-position violation indicators.
     """
-    count, seq_len, feat_dim = sequences.shape
     if hasattr(model, "sequence_anomaly_score"):
-        per_window = np.asarray(model.sequence_anomaly_score(sequences),
-                                dtype=np.float64)
-        if per_window.shape != (count, seq_len):
-            raise ValueError(f"sequence_anomaly_score shape {per_window.shape} != {(count, seq_len)}")
-    else:
-        per_window = score_windows(model, sequences.reshape(count * seq_len, feat_dim))
-        per_window = per_window.reshape(count, seq_len)
+        per_position = np.asarray(model.sequence_anomaly_score(sequences),
+                                  dtype=np.float64)
+        return aggregate_scores(per_position, aggregation)
+    # window-model fallback: reshape (N, T, F) -> (N*T, F)
+    count, seq_len, feat_dim = sequences.shape
+    per_window = score_windows(model, sequences.reshape(count * seq_len, feat_dim))
+    per_window = per_window.reshape(count, seq_len)
     return aggregate_scores(per_window, aggregation)
 
 
@@ -157,9 +175,11 @@ def score_sequences_masked(model, base_sequences, mask, aggregation, batch=4096)
     """
     idx = np.flatnonzero(mask)
     count = int(len(idx))
+    # token models use int32, feature models use float32
+    dtype = np.int32 if base_sequences.dtype == np.int32 else np.float32
     if count <= batch:
-        return score_sequences(model, base_sequences[idx].astype(np.float32), aggregation)
-    parts = [score_sequences(model, base_sequences[idx[i:i + batch]].astype(np.float32),
+        return score_sequences(model, base_sequences[idx].astype(dtype), aggregation)
+    parts = [score_sequences(model, base_sequences[idx[i:i + batch]].astype(dtype),
                              aggregation)
              for i in range(0, count, batch)]
     return np.concatenate(parts)
