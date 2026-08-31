@@ -21,10 +21,10 @@ All data from the frozen ocsvm model (seed 42, final-v2):
 Usage:
     python3 scripts/visualize/demo_figure.py \
         --run runs/2026-08-21_ocsvm_v2_ocsvm_s42_072736 \
-        --attack-data datasets/final-v2/processed/attack \
-        --normal-data datasets/final-v2/processed/normal \
+        --attack-data datasets/processed/attack \
+        --normal-data datasets/processed/normal \
         --mode both \
-        --out datasets/final-v2/report/heapspray_demo.png
+        --out datasets/report/heapspray_demo.png
 """
 
 import argparse

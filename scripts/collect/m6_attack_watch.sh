@@ -7,7 +7,7 @@
 # the cron (job 10b94e5a) just exits 0.
 set -u
 cd "$(dirname "$0")/../.."
-DATA="$PWD/datasets/final-v2"
+DATA="$PWD/datasets"
 MARK="$DATA/.m6/attack_collect.done"
 LOG="$DATA/.m6/logs/attack_watch.log"
 

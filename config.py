@@ -17,9 +17,13 @@ ATTACK_PROC_DIR = os.path.join(PROCESSED_DIR, "attack")
 # Versioned v2 directories (IMPLEMENTATION_PLAN.md section 3). New code defaults
 # to writing here; legacy data/ and results/ are left untouched.
 DATASETS_DIR = os.path.join(BASE_DIR, "datasets")
-LEGACY_V1_DIR = os.path.join(DATASETS_DIR, "legacy-v1")
-PILOT_V2_DIR = os.path.join(DATASETS_DIR, "pilot-v2")
-FINAL_V2_DIR = os.path.join(DATASETS_DIR, "final-v2")
+# Unified CVE-first layout (restructure 2026-08-31):
+#   raw/<CVE>/{attack,normal,baseline}/<variant|workload>/run_XXX_*/
+#   processed/{attack,normal}/features.npz
+#   dataset_manifest.json
+DATASETS_RAW_DIR = os.path.join(DATASETS_DIR, "raw")
+DATASETS_PROCESSED_DIR = os.path.join(DATASETS_DIR, "processed")
+DATASET_MANIFEST_PATH = os.path.join(DATASETS_DIR, "dataset_manifest.json")
 RUNS_DIR = os.path.join(BASE_DIR, "runs")
 
 CVE_LIST = [

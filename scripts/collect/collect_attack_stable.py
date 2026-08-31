@@ -140,7 +140,10 @@ def stop_reader(reader):
 def run_one_attack(cve, cve_folder, variant, index, output_root, pre_seconds,
                    post_seconds, poc_timeout, minimum_events, expect_crash):
     run_uuid = make_run_id(index)
-    run_dir = output_root / cve / variant / run_uuid
+    # CVE-first layout (datasets restructure): raw/<CVE>/{attack,baseline}/...
+    # baseline PoCs share the attack collector but land in the baseline class dir.
+    run_class = "baseline" if variant == "poc_cfh_baseline" else "attack"
+    run_dir = output_root / cve / run_class / variant / run_uuid
     run_dir.mkdir(parents=True, exist_ok=False)
     trace_path = run_dir / "trace.log"
     stats_path = run_dir / "trace_stats.txt"
@@ -331,9 +334,12 @@ def main():
     output_root = Path(args.output)
     output_root.mkdir(parents=True, exist_ok=True)
 
+    # CVE-first layout: collection_report.json is class-scoped so the shared
+    # datasets/raw root doesn't collide between attack and baseline invocations.
+    report_class = "baseline" if args.variants == ["poc_cfh_baseline"] else "attack"
     report = {
         "schema_version": 2,
-        "class": "attack",
+        "class": report_class,
         "expect_crash": args.expect_crash,
         "cves": {},
     }
@@ -363,7 +369,13 @@ def main():
             log.info("[%s/%s] completed: %d/%d valid",
                      cve, variant, sum(item["valid"] for item in outcomes), len(outcomes))
 
-    with (output_root / "collection_report.json").open("w") as handle:
+    # Collection metadata goes under <root>/.m6/ (same dir as the orchestration
+    # .done markers / logs, not the CVE-first raw/ tree which must contain only
+    # CVE dirs). Class-scoped name avoids attack/baseline invocations
+    # overwriting each other.
+    report_path = output_root.parent / ".m6" / f"collection_report_{report_class}.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with report_path.open("w") as handle:
         json.dump(report, handle, indent=2)
     total_valid = sum(v["valid"] for c in report["cves"].values() for v in c.values())
     total_runs = sum(v["total"] for c in report["cves"].values() for v in c.values())

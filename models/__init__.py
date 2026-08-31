@@ -8,7 +8,6 @@ from .ocsvm import OCSVMDetector
 from .random_forest import RandomForestDetector
 from .lof_detector import LOFDetector
 from .pca_detector import PCADetector
-from .ngram import NGramDetector
 
 MODEL_REGISTRY = {
     "lstm_vae": LSTMVAE,
@@ -21,5 +20,4 @@ MODEL_REGISTRY = {
     "random_forest": RandomForestDetector,
     "lof": LOFDetector,
     "pca": PCADetector,
-    "ngram": NGramDetector,
 }

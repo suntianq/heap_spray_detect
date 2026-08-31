@@ -101,7 +101,8 @@ def run_one(cve, cve_folder, workload, index, duration, pre_seconds, post_second
             output_root, workloads, msg_size=None):
     run_id = make_run_id(index)
     workload_label = f"{workload}_{msg_size}" if (workload == "msg_msg" and msg_size) else workload
-    run_dir = output_root / cve / workload_label / run_id
+    # CVE-first layout (datasets restructure): raw/<CVE>/normal/<workload>/...
+    run_dir = output_root / cve / "normal" / workload_label / run_id
     run_dir.mkdir(parents=True, exist_ok=False)
     trace_path = run_dir / "trace.log"
     stats_path = run_dir / "trace_stats.txt"
@@ -274,7 +275,12 @@ def main():
                     args.workloads)
                 report["runs"].append({"manifest": str(manifest.relative_to(output_root)), "valid": ok})
 
-    with (output_root / "collection_report.json").open("w") as handle:
+    # Collection metadata goes under <root>/.m6/ (same dir as the orchestration
+    # .done markers / logs, not the CVE-first raw/ tree which must contain only
+    # CVE dirs).
+    report_path = output_root.parent / ".m6" / "collection_report_normal.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with report_path.open("w") as handle:
         json.dump(report, handle, indent=2)
     valid = sum(item["valid"] for item in report["runs"])
     log.info("Collection complete: %d/%d valid", valid, len(report["runs"]))

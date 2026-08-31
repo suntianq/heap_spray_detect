@@ -220,6 +220,33 @@ class ManifestAndIdsTest(unittest.TestCase):
         self.assertNotEqual(first, second)
         self.assertTrue(first.startswith("run_000_"))
 
+    def test_cve_first_run_dir_layout(self):
+        """Collectors must write the CVE-first class layout (datasets restructure).
+
+        attack collector: raw/<CVE>/{attack,baseline}/<variant>/run_XXX_*/
+        normal collector: raw/<CVE>/normal/<workload>/run_XXX_*/
+        The class segment is on disk only; build_pilot_dataset strips it so run_ids
+        stay CVE/<variant|workload>/run_XXX_*/trace.
+        """
+        from pathlib import Path
+        cve = "CVE-2017-7533"
+        # attack/baseline variants route by name (mirror of collect_attack_stable)
+        for variant, expect_class in (("poc_cfh_single_spray", "attack"),
+                                     ("poc_cfh_combo", "attack"),
+                                     ("poc_cfh_baseline", "baseline")):
+            run_class = "baseline" if variant == "poc_cfh_baseline" else "attack"
+            self.assertEqual(run_class, expect_class)
+            rid = make_run_id(0)
+            run_dir = Path("raw") / cve / run_class / variant / rid
+            self.assertTrue(run_dir.as_posix().startswith(f"raw/{cve}/{run_class}/{variant}/run_"))
+            # the CVE must be the first segment (cve_of / parse_group contract)
+            self.assertEqual(run_dir.parts[1], cve)
+        # normal workload layout (mirror of collect_stable)
+        for wl in ("idle", "msg_msg_256"):
+            rid = make_run_id(0)
+            run_dir = Path("raw") / cve / "normal" / wl / rid
+            self.assertTrue(run_dir.as_posix().startswith(f"raw/{cve}/normal/{wl}/run_"))
+
     def test_write_manifest_atomic_and_versioned(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:

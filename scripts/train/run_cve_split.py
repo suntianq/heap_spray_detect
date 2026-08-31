@@ -95,7 +95,7 @@ def main():
                         help="CVEs whose data is used for evaluation (normal test + attack)")
     parser.add_argument("--attack-data", required=True)
     parser.add_argument("--normal-data", required=True)
-    parser.add_argument("--dataset-manifest", default="datasets/final-v2/dataset_manifest.json")
+    parser.add_argument("--dataset-manifest", default="datasets/dataset_manifest.json")
     parser.add_argument("--out", default=config.RUNS_DIR)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--val-fraction", type=float, default=common.DEFAULT_VAL_FRACTION)

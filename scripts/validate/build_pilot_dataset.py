@@ -1,23 +1,36 @@
 #!/usr/bin/env python3
 """Build the pilot-v2 processed datasets and run the acceptance gates.
 
-Pipeline (after collection):
-  1. trace2csv on raw attack dir          -> csv/attack
-  2. trace2csv on raw normal dir          -> csv/normal
-  3. mark baseline PoCs as class=normal   -> runs_meta.json
+Pipeline (after collection), on the CVE-first raw layout
+(datasets/raw/<CVE>/{attack,normal,baseline}/<variant|workload>/run_XXX_*/):
+  1. trace2csv on the whole raw root         -> .tmp/csv_all
+  2. _split_class_csv: drop the class segment into class-stripped staging
+     (.tmp/attack, .tmp/normal); rewrite spray_markers.json keys accordingly
+  3. mark baseline PoCs as class=normal       -> runs_meta.json
   4. csv2features attack  -> processed/attack
   5. csv2features normal  -> processed/normal
   6. pilot_gates.py on both processed dirs
+  7. build_dataset_manifest at the out root
+  8. remove .tmp (no csv/ intermediate storage survives)
 
-Baseline PoCs are collected by the attack collector (they run the exploit
-path and may crash), but are NEGATIVE samples by design (7.2): their windows
-are labelled 0 like any other normal workload. Path parsing would classify them
-as attack (they live under a CVE dir), so a --run-meta override flips them back.
+Why the class segment is stripped at the staging step: the on-disk raw layout
+nests the class between CVE and variant/workload, but run_ids MUST keep the form
+CVE/<variant|workload>/run_000_*/trace (cve_of / run_stratum / parse_group /
+parse_run_metadata / G10 baseline detection all assume no class segment). Moving
+the class subdir up in the staging tree drops that segment so every downstream
+run_id consumer is byte-for-byte unaffected.
+
+Baseline PoCs are collected by the attack collector (they run the exploit path
+and may crash), but are NEGATIVE samples by design (7.2): their windows are
+labelled 0 like any other normal workload. Path parsing would classify them as
+attack (they carry a poc_cfh_* segment), so a --run-meta override flips them
+back (build_run_meta below).
 """
 
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -61,12 +74,75 @@ def clear_dir(path):
     if path.is_dir():
         for child in path.iterdir():
             if child.is_dir() and not child.is_symlink():
-                import shutil
                 shutil.rmtree(child)
             else:
                 child.unlink()
     path.mkdir(parents=True, exist_ok=True)
     print(f"cleared {path}")
+
+
+def _split_class_csv(all_csv_dir, attack_csv_dir, normal_csv_dir):
+    """Split trace2csv output into two class-stripped staging trees.
+
+    all_csv_dir mirrors the raw layout: <CVE>/{attack,normal,baseline}/...
+    (each leaf being a run dir with trace.csv + spray markers keyed by
+    input-relative *.log paths). The class segment must be dropped before
+    csv2features derives run_ids, and spray_markers.json keys must be rewritten
+    to match the class-free run_id (run_id + ".log").
+
+    Returns None; mutates the staging dirs. attack-class runs go to
+    attack_csv_dir, normal+baseline to normal_csv_dir (baseline is flipped to
+    normal later by build_run_meta).
+    """
+    for cve_dir in sorted(all_csv_dir.iterdir()):
+        if not cve_dir.is_dir():
+            continue
+        for cls in ("attack", "normal", "baseline"):
+            class_dir = cve_dir / cls
+            if not class_dir.is_dir():
+                continue
+            dest_cve = (attack_csv_dir if cls == "attack" else normal_csv_dir) / cve_dir.name
+            dest_cve.mkdir(parents=True, exist_ok=True)
+            # move every <variant|workload> subdir up, dropping the class segment
+            for sub in sorted(class_dir.iterdir()):
+                dst = dest_cve / sub.name
+                if dst.exists():
+                    shutil.rmtree(dst)
+                shutil.move(str(sub), str(dst))
+            shutil.rmtree(class_dir)
+            print(f"class-split: {cve_dir.name}/{cls} -> {dest_cve.relative_to(dest_cve.parents[1])}")
+        # remove empty CVE dir (no run dirs left after moves)
+        if not any(cve_dir.iterdir()):
+            cve_dir.rmdir()
+
+    # rewrite spray_markers.json: keys are input-relative *.log paths like
+    # <CVE>/<class>/<variant|workload>/run_XXX_*/trace.log -> <CVE>/<...>/trace.log
+    # routed to the matching staging root's spray_markers.json.
+    marker_path = all_csv_dir / "spray_markers.json"
+    if marker_path.is_file():
+        markers = json.loads(marker_path.read_text())
+    else:
+        markers = {}
+    attack_markers, normal_markers = {}, {}
+    for key, value in markers.items():
+        parts = str(key).split("/")
+        if len(parts) >= 2 and parts[1] in ("attack", "normal", "baseline"):
+            cls = parts[1]
+            new_key = "/".join(parts[:1] + parts[2:])
+        else:  # no class segment (legacy layout) — route by variant heuristic
+            cls = "attack" if any("poc_cfh_" in p for p in parts) else "normal"
+            new_key = str(key)
+        target = attack_markers if cls == "attack" else normal_markers
+        target[new_key] = value
+    for cls, target, dest in (("attack", attack_markers, attack_csv_dir),
+                              ("normal", normal_markers, normal_csv_dir)):
+        if target:
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / "spray_markers.json").write_text(json.dumps(target, indent=2))
+            print(f"spray_markers rewritten: {cls} ({len(target)} keys) -> {dest}")
+    # remove the merged marker file (it is split into the staging roots)
+    if marker_path.is_file():
+        marker_path.unlink()
 
 
 def build_run_meta(csv_normal):
@@ -85,7 +161,7 @@ def build_run_meta(csv_normal):
 
 
 def build_dataset_manifest(out, raw_dirs):
-    """Record every run's manifest in datasets/<kind>/dataset_manifest.json.
+    """Record every run's manifest in datasets/dataset_manifest.json.
 
     The template file describes the planned layout; this populates its run
     registry so any model metric can be traced to a concrete run (plan 4.2).
@@ -107,7 +183,7 @@ def build_dataset_manifest(out, raw_dirs):
             if not rid or rid.endswith("None/trace"):
                 continue
             registry[rid] = {
-                "class": m.get("class"),
+                "class": "normal" if m.get("variant") == "poc_cfh_baseline" else m.get("class"),
                 "status": m.get("status"),
                 "cve": m.get("cve"),
                 "variant": m.get("variant"),
@@ -125,11 +201,6 @@ def build_dataset_manifest(out, raw_dirs):
         "valid": valid,
         "invalid": len(registry) - valid,
     }
-    # Record the CVEs/variants actually collected. The pilot template carried a
-    # `cve_variants` placeholder block (planned names replaced with the real
-    # plan target slabs); the final-v2 template (schema v2, with sealed
-    # dev/test CVE bookkeeping) does not. Build the block from the registry so
-    # either template shape is populated correctly.
     collected = {}
     for cve in sorted({r.get("cve") for r in registry.values() if r.get("cve")}):
         variants = sorted({r.get("variant") for r in registry.values()
@@ -151,30 +222,34 @@ def build_dataset_manifest(out, raw_dirs):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Build pilot-v2 processed datasets + run gates")
-    parser.add_argument("--attack-raw", required=True)
-    parser.add_argument("--normal-raw", required=True,
-                        help="raw dir of normal workloads (idle, msg_msg)")
-    parser.add_argument("--baseline-raw", required=True,
-                        help="raw dir of baseline PoCs (collected by collect_attack_stable)")
-    parser.add_argument("--out", required=True, help="datasets/pilot-v2 dir")
+    parser = argparse.ArgumentParser(
+        description="Build pilot-v2 processed datasets + run gates from the CVE-first raw root")
+    parser.add_argument("--raw", required=True,
+                        help="datasets/raw root: <CVE>/{attack,normal,baseline}/<variant|workload>/<run>/")
+    parser.add_argument("--out", required=True,
+                        help="datasets root: writes processed/{attack,normal} + dataset_manifest.json; .tmp is transient")
+    parser.add_argument("--skip-gates", action="store_true",
+                        help="skip pilot_gates (used by unit tests on synthetic data that "
+                             "cannot satisfy the data-quality gates G3/G5/G9)")
     args = parser.parse_args()
 
     out = Path(args.out)
-    csv_attack = out / "csv" / "attack"
-    csv_normal = out / "csv" / "normal"
+    tmp = out / ".tmp"
+    csv_all = tmp / "csv_all"
+    csv_attack = tmp / "attack"
+    csv_normal = tmp / "normal"
     proc_attack = out / "processed" / "attack"
     proc_normal = out / "processed" / "normal"
     # Clear derived dirs first: stale CSVs from earlier builds (moved/deleted
     # raw runs) must not leak into the rebuilt dataset.
-    for d in (csv_attack, csv_normal, proc_attack, proc_normal):
+    for d in (csv_all, csv_attack, csv_normal, proc_attack, proc_normal):
         clear_dir(d)
 
-    run(["python3", TRACE2CSV, "-i", args.attack_raw, "-o", csv_attack])
-    # Baseline PoCs are negative samples; they merge into the normal CSV set.
-    run(["python3", TRACE2CSV, "-i", args.normal_raw, "-o", csv_normal])
-    run(["python3", TRACE2CSV, "-i", args.baseline_raw, "-o", csv_normal])
+    # trace2csv on the whole raw root mirrors <CVE>/{attack,normal,baseline}/...
+    run(["python3", TRACE2CSV, "-i", args.raw, "-o", csv_all])
+    _split_class_csv(csv_all, csv_attack, csv_normal)
 
+    # Baseline PoCs are negative samples; they merge into the normal CSV set.
     meta_path = build_run_meta(csv_normal)
 
     run(["python3", CSV2FEATURES, "-i", csv_attack, "-o", proc_attack,
@@ -185,9 +260,16 @@ def main():
          "-w", WINDOW_MS, "-s", STRIDE_MS, "--seq-len", SEQ_LEN,
          "--run-meta", meta_path, "--force"])
 
-    run(["python3", PILOT_GATES, "--attack", proc_attack, "--normal", proc_normal])
+    if not args.skip_gates:
+        run(["python3", PILOT_GATES, "--attack", proc_attack, "--normal", proc_normal])
+    else:
+        print("SKIP: pilot_gates (--skip-gates)")
 
-    build_dataset_manifest(out, [args.attack_raw, args.normal_raw, args.baseline_raw])
+    build_dataset_manifest(out, [Path(args.raw)])
+
+    # No csv/ intermediate storage survives the build.
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f"removed transient staging {tmp}")
 
 
 if __name__ == "__main__":

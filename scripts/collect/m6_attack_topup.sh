@@ -22,8 +22,8 @@ cd "$(dirname "$0")/../.."
 
 ROOT="$PWD"
 PY="$ROOT/.venv/bin/python3"
-DATA="$ROOT/datasets/final-v2"
-RAW_ATTACK="$DATA/raw/attack"
+DATA="$ROOT/datasets"
+RAW="$DATA/raw"
 MARK_DIR="$DATA/.m6"
 LOG_DIR="$DATA/.m6/logs"
 PIPE_PIDFILE="$DATA/.m6/pipeline.pid"
@@ -59,8 +59,8 @@ fi
 echo "[topup] pipeline pid: ${PIPE_PID:-none}"
 
 # --- per-variant valid counts ---
-valid_of() { # cve variant
-  local d="$RAW_ATTACK/$1/$2"
+valid_of() { # cve class variant
+  local d="$RAW/$1/$2/$3"
   if [ ! -d "$d" ]; then
     echo 0; return 0
   fi
@@ -71,7 +71,7 @@ valid_of() { # cve variant
 shortfalls=()
 for cve in CVE-2017-11176 CVE-2017-7308; do
   for variant in poc_cfh_single_spray poc_cfh_combo; do
-    v=$(valid_of "$cve" "$variant")
+    v=$(valid_of "$cve" attack "$variant")
     if [ "$v" -lt "$MIN_VALID" ]; then
       short=$(( MIN_VALID - v ))
       echo "[topup] $cve/$variant: $v valid, short by $short"
@@ -105,7 +105,7 @@ for entry in "${shortfalls[@]}"; do
   variant=${rest%%|*}; short=${rest##*|}
   attempted=0
   while :; do
-    v=$(valid_of "$cve" "$variant")
+    v=$(valid_of "$cve" attack "$variant")
     if [ "$v" -ge "$MIN_VALID" ]; then
       echo "[topup] $cve/$variant reached $v valid (after $attempted attempts)"
       break
@@ -123,7 +123,7 @@ for entry in "${shortfalls[@]}"; do
     # 11176/combo came back 0/15. Match pilot here.
     echo "[topup] collecting $cve/$variant batch (valid=$v, attempted=$attempted)"
     "$PY" scripts/collect/collect_attack_stable.py -c "$cve" -v "$variant" \
-        -n 6 --expect-crash "$cve" --poc-timeout 90 -o "$RAW_ATTACK" \
+        -n 6 --expect-crash "$cve" --poc-timeout 90 -o "$RAW" \
         >> "$LOG_DIR/attack_topup.log" 2>&1 \
       || echo "[topup] WARN: batch for $cve/$variant rc=$? (may still have banked valid runs)"
     attempted=$(( attempted + 6 ))
@@ -134,10 +134,10 @@ done
 echo "[topup] post-topup counts:"
 for cve in CVE-2017-11176 CVE-2017-7308; do
   for variant in poc_cfh_single_spray poc_cfh_combo; do
-    v=$(valid_of "$cve" "$variant")
+    v=$(valid_of "$cve" attack "$variant")
     echo "  $cve/$variant: $v valid"
   done
-  b=$(valid_of "$cve" "poc_cfh_baseline")
+  b=$(valid_of "$cve" baseline "poc_cfh_baseline")
   echo "  $cve/poc_cfh_baseline: $b valid"
 done
 

@@ -120,7 +120,7 @@ def main():
 
     runs_dir = Path(args.runs)
     data = Path(args.dataset)
-    attack_data = str(Path("datasets/final-v2/processed/attack"))
+    attack_data = str(Path("datasets/processed/attack"))
     exps = load_experiments(runs_dir, attack_data)
 
     manifest = json.loads((data / "dataset_manifest.json").read_text())
@@ -139,7 +139,7 @@ def main():
                  f"门禁全部通过，{len(exps)} 模型横向对比（本次不做 leave-one-CVE-out），冻结最终测试结果。")
     w(loo_intro)
     w("")
-    w("## 数据集（datasets/final-v2）")
+    w("## 数据集（datasets）")
     w("")
     sealed = "True（2026-08-21 M6 验收冻结）" if manifest.get("sealed") else "False"
     w(f"- run 总数 {rc.get('total', 0)}，有效 {rc.get('valid', 0)}，无效 {rc.get('invalid', 0)}；"
@@ -225,7 +225,7 @@ def main():
     w("")
     w("- 每个实验目录含 experiment_config.json（记录 inputs sha256 / git_revision / python 版本）、"
       "split_manifest.json、evaluation_report.json、gates.json、metrics.csv。")
-    w("- 输入为 datasets/final-v2/processed/{attack,normal}，schema_version=2，seed=42，"
+    w("- 输入为 datasets/processed/{attack,normal}，schema_version=2，seed=42，"
       "序列评分聚合 max，阈值 = 验证集 p99 分位（不优化测试集）。")
     w("- ngram 说明：ngram 是 run 级 token 模型（对每个 run 的原始事件流按 A_/F_ bucket 做 3-gram），"
       "评分单元是 run 而非窗口，故 seq 列与窗口/序列吞吐为 '-'；其 7308/11176 列与 LOO 为 run 级 "

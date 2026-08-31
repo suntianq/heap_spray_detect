@@ -25,19 +25,9 @@ SCENARIOS = {
     "cveABC_testC":    ("ABC→C",    "数据增强"),
     "cveC_testAB":     ("C→AB",     "反向迁移"),
 }
-MODELS = ["ocsvm", "mlp_ae", "lstm_ae", "lstm_vae", "ngram"]
+MODELS = ["ocsvm", "mlp_ae", "lstm_ae", "lstm_vae"]
 
 DIR_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(cve[^_]+_[^_]+)_v2_([a-z_0-9]+)_s(\d+)_(\d{6})$")
-# ngram experiment dirs carry the CVE numbers as a suffix:
-# <date>_ngram_v2_ngram_s<seed>_<HHMMSS>_<trainNums>_test_<testNums>
-NGRAM_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_ngram_v2_ngram_s(\d+)_(\d{6})_(\d+)_test_(\d+)$")
-# suffix (train nums, test nums) -> scenario tag
-NGRAM_TAG = {
-    ("111767308", "2636"): "cveAB_testC",
-    ("1117673082636", "1117673082636"): "cveABC_testABC",
-    ("1117673082636", "2636"): "cveABC_testC",
-    ("2636", "111767308"): "cveC_testAB",
-}
 
 
 def load_gates(exp_dir):
@@ -79,16 +69,9 @@ def main():
         if not os.path.isfile(os.path.join(path, "evaluation_report.json")):
             continue
         m = DIR_RE.match(name)
-        if m:
-            _, tag, model, _seed, _stamp = m.groups()
-        else:
-            nm = NGRAM_RE.match(name)
-            if not nm:
-                continue
-            model = "ngram"
-            tag = NGRAM_TAG.get((nm.group(4), nm.group(5)))
-            if tag is None:
-                continue
+        if not m:
+            continue
+        _, tag, model, _seed, _stamp = m.groups()
         if tag not in SCENARIOS or model not in MODELS:
             continue
         with open(os.path.join(path, "evaluation_report.json")) as f:

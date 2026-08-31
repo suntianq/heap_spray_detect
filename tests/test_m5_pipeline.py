@@ -26,9 +26,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts", "tra
 from scripts.train import common
 
 ROOT = Path(__file__).resolve().parents[1]
-TRACE2CSV = ROOT / "scripts" / "preprocess" / "trace2csv.py"
-CSV2FEATURES = ROOT / "scripts" / "preprocess" / "csv2features.py"
 RUN_EXPERIMENT = ROOT / "scripts" / "train" / "run_experiment.py"
+BUILD_PILOT = ROOT / "scripts" / "validate" / "build_pilot_dataset.py"
 VENV_PY = ROOT / ".venv" / "bin" / "python3"
 
 
@@ -80,12 +79,15 @@ def write_trace(path, background_size, spray=None, spray_start_ns=None, spray_en
 
 
 def build_synthetic_root(tmp):
-    """Create raw/attack + raw/normal with 2 attack, 4 idle, 3 baseline runs."""
+    """Create a CVE-first raw root with 2 attack, 4 idle, 3 baseline runs.
+
+    Layout (datasets restructure): raw/<CVE>/{attack,normal,baseline}/<variant|workload>/run/...
+    """
     root = Path(tmp)
     spray_start, spray_end = 2_000_000_000, 2_200_000_000
-    attack_dir = root / "raw" / "attack" / "CVE-SYN-ATT" / "poc_spray"
-    normal_dir = root / "raw" / "normal" / "CVE-SYN" / "idle"
-    base_dir = root / "raw" / "normal" / "CVE-SYN" / "poc_cfh_baseline"
+    attack_dir = root / "raw" / "CVE-SYN-ATT" / "attack" / "poc_spray"
+    normal_dir = root / "raw" / "CVE-SYN" / "normal" / "idle"
+    base_dir = root / "raw" / "CVE-SYN" / "baseline" / "poc_cfh_baseline"
 
     for i in range(2):
         d = attack_dir / f"run_00{i}_synatt{i}"
@@ -110,8 +112,10 @@ def build_synthetic_root(tmp):
         d.mkdir(parents=True)
         write_trace(d / "trace.log", 96)
         with open(d / "manifest.json", "w") as f:
-            json.dump({"status": "valid", "class": "normal", "cve": "CVE-SYN",
-                       "workload": "poc_cfh_baseline"}, f)
+            # baseline PoCs are collected by the attack collector -> class=attack,
+            # and flipped to normal by build_run_meta via /poc_cfh_baseline/.
+            json.dump({"status": "valid", "class": "attack", "cve": "CVE-SYN",
+                       "variant": "poc_cfh_baseline", "workload": "poc_cfh_baseline"}, f)
 
     return root / "raw"
 
@@ -126,21 +130,17 @@ class TestM5Pipeline(unittest.TestCase):
 
     def run_pipeline(self):
         out = self.out
-        csv_attack = out / "csv" / "attack"
-        csv_normal = out / "csv" / "normal"
+        # New build entry point (datasets restructure): --raw (CVE-first root)
+        # -> processed/{attack,normal} + dataset_manifest.json; csv staging is
+        # transient (.tmp) and removed by the build.
+        # --skip-gates: synthetic traces cannot satisfy the data-quality gates
+        # (G3 empty windows, G5 PoC comm, G9 duration overlap); the M5 test
+        # validates the model-level gates (G7/G8/G10) via run_experiment.
+        run([sys.executable, BUILD_PILOT, "--raw", self.raw, "--out", out,
+             "--skip-gates"], cwd=ROOT)
+
         proc_attack = out / "processed" / "attack"
         proc_normal = out / "processed" / "normal"
-        for d in (csv_attack, csv_normal, proc_attack, proc_normal):
-            d.mkdir(parents=True, exist_ok=True)
-
-        run([sys.executable, TRACE2CSV, "-i", self.raw / "attack", "-o", csv_attack], cwd=ROOT)
-        run([sys.executable, TRACE2CSV, "-i", self.raw / "normal", "-o", csv_normal], cwd=ROOT)
-        run([sys.executable, CSV2FEATURES, "-i", csv_attack, "-o", proc_attack,
-             "-w", 100, "-s", 50, "--seq-len", 32, "--is-attack",
-             "--markers", csv_attack / "spray_markers.json",
-             "--sequence-label", "any", "--force"], cwd=ROOT)
-        run([sys.executable, CSV2FEATURES, "-i", csv_normal, "-o", proc_normal,
-             "-w", 100, "-s", 50, "--seq-len", 32, "--force"], cwd=ROOT)
 
         runs_dir = Path(self.tmp) / "runs"
         run([VENV_PY, RUN_EXPERIMENT, "--model", "stat_threshold",

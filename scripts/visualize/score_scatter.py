@@ -21,10 +21,10 @@ model never trained on; attack boundary windows (label -1) are dropped.
 Usage:
     python3 scripts/visualize/score_scatter.py \
         --run runs/2026-08-21_ocsvm_v2_ocsvm_s42_072736 \
-        --attack-data datasets/final-v2/processed/attack \
-        --normal-data datasets/final-v2/processed/normal \
+        --attack-data datasets/processed/attack \
+        --normal-data datasets/processed/normal \
         --level window \
-        --out datasets/final-v2/report/score_scatter_ocsvm_window.png
+        --out datasets/report/score_scatter_ocsvm_window.png
 """
 
 import argparse

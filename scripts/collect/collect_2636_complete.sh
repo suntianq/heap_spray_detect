@@ -13,7 +13,7 @@
 #
 # Launch detached (survives session close):
 #   nohup scripts/collect/collect_2636_complete.sh \
-#     > datasets/final-v2/.m6/logs/collect_2636_complete.log 2>&1 &
+#     > datasets/.m6/logs/collect_2636_complete.log 2>&1 &
 set -uo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -21,10 +21,8 @@ ROOT="$PWD"
 PY="$ROOT/.venv/bin/python3"
 [[ -x "$PY" ]] || { echo "venv python missing: $PY"; exit 1; }
 
-DATA="$ROOT/datasets/final-v2"
-RAW_ATTACK="$DATA/raw/attack"
-RAW_BASELINE="$DATA/raw/baseline"
-RAW_NORMAL="$DATA/raw/normal"
+DATA="$ROOT/datasets"
+RAW="$DATA/raw"
 MARK_DIR="$DATA/.m6"
 LOG_DIR="$DATA/.m6/logs"
 mkdir -p "$MARK_DIR" "$LOG_DIR"
@@ -36,9 +34,9 @@ COLLECT_DURATION="${COLLECT_DURATION:-30}"
 NORMAL_WORKLOADS="idle msg_msg keyctl net_busy fs_io fork_stress mem_pressure"
 CVE="CVE-2017-2636"
 
-valid_of() { # variant [raw_root]
-  local root="${2:-$RAW_ATTACK}"
-  local vdir="$root/$CVE/$1"
+valid_of() { # class variant
+  local class="$1" variant="$2"
+  local vdir="$RAW/$CVE/$class/$variant"
   if [ ! -d "$vdir" ]; then echo 0; return 0; fi
   grep -rl '"status": "valid"' "$vdir" 2>/dev/null | wc -l
   return 0
@@ -58,13 +56,13 @@ if [ ! -f "$MARK_DIR/collect_2636_attack_topup.done" ]; then
   for variant in poc_cfh_single_spray poc_cfh_combo; do
     attempted=0
     while :; do
-      v=$(valid_of "$variant")
+      v=$(valid_of attack "$variant")
       [ "$v" -ge "$MIN_VALID" ] && { echo "[2636] $variant: $v valid OK"; break; }
       [ "$attempted" -ge "$MAX_ATTEMPTS_PER_VARIANT" ] && {
         echo "[2636] $variant: attempt cap reached, $v valid (shortfall)"; break; }
       echo "[2636] $variant top-up batch (valid=$v, attempted=$attempted) $(date -Is)"
       "$PY" scripts/collect/collect_attack_stable.py -c "$CVE" -v "$variant" \
-          -n 6 --expect-crash "$CVE" --poc-timeout 90 -o "$RAW_ATTACK" \
+          -n 6 --expect-crash "$CVE" --poc-timeout 90 -o "$RAW" \
           >> "$LOG_DIR/collect_2636_attack_topup.log" 2>&1 \
         || echo "[2636] WARN: batch for $variant rc=$? (may still bank valid runs)"
       attempted=$(( attempted + 6 ))
@@ -77,14 +75,14 @@ fi
 if [ ! -f "$MARK_DIR/collect_2636_baseline.done" ]; then
   attempted=0
   while :; do
-    v=$(valid_of poc_cfh_baseline "$RAW_BASELINE")
+    v=$(valid_of baseline poc_cfh_baseline)
     [ "$v" -ge "$MIN_VALID" ] && { echo "[2636] baseline: $v valid OK"; break; }
     [ "$attempted" -ge "$MAX_ATTEMPTS_PER_VARIANT" ] && {
       echo "[2636] baseline: attempt cap reached, $v valid (shortfall)"; break; }
     echo "[2636] baseline batch (valid=$v, attempted=$attempted) $(date -Is)"
     "$PY" scripts/collect/collect_attack_stable.py -c "$CVE" \
         -v poc_cfh_baseline -n 6 --expect-crash "$CVE" --poc-timeout 90 \
-        -o "$RAW_BASELINE" >> "$LOG_DIR/collect_2636_baseline.log" 2>&1 \
+        -o "$RAW" >> "$LOG_DIR/collect_2636_baseline.log" 2>&1 \
       || echo "[2636] WARN: baseline batch rc=$? (may still bank valid runs)"
     attempted=$(( attempted + 6 ))
   done
@@ -96,7 +94,7 @@ if [ ! -f "$MARK_DIR/collect_2636_normal.done" ]; then
   echo "[2636] normal collection start $(date -Is) (duration=$COLLECT_DURATION)"
   "$PY" scripts/collect/collect_stable.py -c "$CVE" \
       -n "$NORMAL_RUNS" -d "$COLLECT_DURATION" \
-      -w $NORMAL_WORKLOADS --msg-sizes 256 2048 -o "$RAW_NORMAL" \
+      -w $NORMAL_WORKLOADS --msg-sizes 256 2048 -o "$RAW" \
       > "$LOG_DIR/collect_2636_normal.log" 2>&1
   rc=$?
   if [ $rc -eq 0 ]; then
@@ -112,6 +110,6 @@ fi
 echo "[2636] ALL DONE $(date -Is)"
 echo "[2636] summary:"
 for variant in poc_cfh_single_spray poc_cfh_combo; do
-  echo "  attack/$variant: $(valid_of "$variant") valid"
+  echo "  attack/$variant: $(valid_of attack "$variant") valid"
 done
-echo "  baseline: $(valid_of poc_cfh_baseline "$RAW_BASELINE") valid"
+echo "  baseline: $(valid_of baseline poc_cfh_baseline) valid"
