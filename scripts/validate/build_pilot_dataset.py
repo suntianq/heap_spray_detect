@@ -236,6 +236,9 @@ def main():
     parser.add_argument("--skip-gates", action="store_true",
                         help="skip pilot_gates (used by unit tests on synthetic data that "
                              "cannot satisfy the data-quality gates G3/G5/G9)")
+    parser.add_argument("--workers", type=int,
+                        default=max(1, int((os.cpu_count() or 1) * 0.8)),
+                        help="number of parallel workers for trace2csv/csv2features")
     args = parser.parse_args()
 
     out = Path(args.out)
@@ -251,7 +254,7 @@ def main():
         clear_dir(d)
 
     # trace2csv on the whole raw root mirrors <CVE>/{attack,normal,baseline}/...
-    run([PYTHON, TRACE2CSV, "-i", args.raw, "-o", csv_all])
+    run([PYTHON, TRACE2CSV, "-i", args.raw, "-o", csv_all, "--workers", args.workers])
     _split_class_csv(csv_all, csv_attack, csv_normal)
 
     # Baseline PoCs are negative samples; they merge into the normal CSV set.
@@ -260,10 +263,10 @@ def main():
     run([PYTHON, CSV2FEATURES, "-i", csv_attack, "-o", proc_attack,
          "-w", WINDOW_MS, "-s", STRIDE_MS, "--seq-len", SEQ_LEN,
          "--is-attack", "--markers", csv_attack / "spray_markers.json",
-         "--sequence-label", "any", "--force"])
+         "--sequence-label", "any", "--force", "--workers", args.workers])
     run([PYTHON, CSV2FEATURES, "-i", csv_normal, "-o", proc_normal,
          "-w", WINDOW_MS, "-s", STRIDE_MS, "--seq-len", SEQ_LEN,
-         "--run-meta", meta_path, "--force"])
+         "--run-meta", meta_path, "--force", "--workers", args.workers])
 
     if not args.skip_gates:
         run([PYTHON, PILOT_GATES, "--attack", proc_attack, "--normal", proc_normal])

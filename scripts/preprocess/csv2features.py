@@ -21,6 +21,7 @@ import csv
 import json
 import logging
 import math
+import multiprocessing
 import os
 import re
 import sys
@@ -669,6 +670,49 @@ def merge_run_meta(run_records, run_meta_path):
 
 
 # ---------------------------------------------------------------------------
+# Multiprocessing worker (top-level for picklability)
+# ---------------------------------------------------------------------------
+
+def _process_run_worker(task):
+    """Process a single CSV: extract features + build sequences.
+
+    Returns a dict with all per-run arrays, or None if no parseable events.
+    Must be top-level (not nested) to be picklable for multiprocessing.
+    """
+    (csv_path, window, stride, is_attack, spray_start, spray_end,
+     seq_len, sequence_label, boundary_policy, short_run_policy, run_id) = task
+
+    features, labels, starts, top_ids, top_comms, free_stats, empty_ratio = process_csv(
+        csv_path, window, stride, is_attack, spray_start, spray_end)
+
+    if is_attack and spray_start is None and short_run_policy == "__legacy__":
+        labels[:] = 1
+
+    if not len(features):
+        return None
+
+    seq, seq_label, seq_group, seq_start, is_short = build_sequences(
+        features, labels, starts, seq_len, run_id,
+        sequence_label, boundary_policy, stride, window)
+
+    return {
+        "features": features,
+        "labels": labels,
+        "starts": starts,
+        "top_ids": top_ids,
+        "top_comms": top_comms,
+        "free_stats": free_stats,
+        "empty_ratio": empty_ratio,
+        "seq": seq,
+        "seq_label": seq_label,
+        "seq_group": seq_group,
+        "seq_start": seq_start,
+        "is_short": is_short,
+        "run_id": run_id,
+    }
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -697,6 +741,9 @@ def main():
                         help="Allow writing into a non-empty output directory")
     parser.add_argument("--normal-stats", default=None,
                         help="Deprecated compatibility option; schema v2 ignores this")
+    parser.add_argument("--workers", type=int,
+                        default=max(1, int((os.cpu_count() or 1) * 0.8)),
+                        help="number of parallel workers for CSV processing")
     args = parser.parse_args()
 
     if args.normal_stats:
@@ -724,6 +771,8 @@ def main():
     run_records = []
     input_hashes = {}
 
+    # Prepare tasks for parallel (or sequential) processing
+    tasks = []
     for csv_path in csv_files:
         relative_csv = csv_path.relative_to(input_root).as_posix()
         run_id = relative_csv[:-4] if relative_csv.endswith(".csv") else relative_csv
@@ -739,17 +788,53 @@ def main():
                     and spray_end <= spray_start) and not args.legacy_all_attack:
                 raise ValueError(f"SPRAY_END <= SPRAY_START for attack run {run_id} (marker order error)")
 
-        features, labels, starts, top_ids, top_comms, free_stats, empty_ratio = process_csv(
-            str(csv_path), args.window, args.stride, args.is_attack, spray_start, spray_end)
-        if args.is_attack and args.legacy_all_attack and spray_start is None:
-            labels[:] = 1
-        if not len(features):
+        legacy_flag = "__legacy" if args.legacy_all_attack else "drop"
+        tasks.append((str(csv_path), args.window, args.stride, args.is_attack,
+                      spray_start, spray_end, args.seq_len, args.sequence_label,
+                      args.boundary_policy, legacy_flag, run_id))
+
+    # Process runs in parallel (or sequential fallback)
+    workers = min(args.workers, len(tasks)) if tasks else 1
+    if workers > 1 and len(tasks) > 1:
+        log.info("Processing %d CSV files with %d workers", len(tasks), workers)
+        with multiprocessing.Pool(workers) as pool:
+            results = pool.map(_process_run_worker, tasks)
+    else:
+        results = [_process_run_worker(t) for t in tasks]
+
+    # Collect results (metadata + hashing stays sequential — it's fast)
+    for result, task in zip(results, tasks):
+        if result is None:
+            csv_path_str = task[0]
+            relative_csv = Path(csv_path_str).relative_to(input_root).as_posix()
             log.warning("%s: no parseable events", relative_csv)
             continue
+        features = result["features"]
+        labels = result["labels"]
+        starts = result["starts"]
+        top_ids = result["top_ids"]
+        top_comms = result["top_comms"]
+        free_stats = result["free_stats"]
+        empty_ratio = result["empty_ratio"]
+        seq = result["seq"]
+        seq_label = result["seq_label"]
+        seq_group = result["seq_group"]
+        seq_start = result["seq_start"]
+        is_short = result["is_short"]
+        run_id = result["run_id"]
+        csv_path = Path(task[0])
+        relative_csv = csv_path.relative_to(input_root).as_posix()
+        spray_start = None
+        spray_end = None
+        # Recover spray markers for run record
+        marker_key = run_id + ".log"
+        run_markers = markers.get(marker_key, {})
+        spray_start = run_markers.get("SPRAY_START")
+        spray_end = run_markers.get("SPRAY_END")
 
-        seq, seq_label, seq_group, seq_start, is_short = build_sequences(
-            features, labels, starts, args.seq_len, run_id,
-            args.sequence_label, args.boundary_policy, args.stride, args.window)
+        if args.is_attack and args.legacy_all_attack and spray_start is None:
+            labels[:] = 1
+
         if is_short and args.short_run_policy == "error":
             raise RuntimeError(f"run {run_id} has {len(features)} windows < seq_len={args.seq_len}")
 

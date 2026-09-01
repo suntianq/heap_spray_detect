@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import sys
+import multiprocessing
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -147,7 +148,11 @@ def discover_runs(raw_dir):
 # ---------------------------------------------------------------------------
 
 def build_call_site_profiles(normal_events_all):
-    """Build call_site → {behavior_type, frequency_rank} from normal events."""
+    """Build call_site → {behavior_type, frequency_rank} from normal events.
+
+    Legacy interface: takes a list of event lists. Prefer
+    build_call_site_profiles_from_stats for parallel workflows.
+    """
     cs_sizes = defaultdict(Counter)
     cs_count = Counter()
     for events in normal_events_all:
@@ -158,15 +163,21 @@ def build_call_site_profiles(normal_events_all):
                 idx = bucket_index(size) if size else 0
                 cs_sizes[cs][idx] += 1
                 cs_count[cs] += 1
+    return build_call_site_profiles_from_stats(
+        {cs: dict(sizes) for cs, sizes in cs_sizes.items()},
+        dict(cs_count))
 
+
+def build_call_site_profiles_from_stats(cs_sizes, cs_count):
+    """Build profiles from pre-collected call_site size stats (parallel-friendly)."""
     profiles = {}
     for cs, sizes in cs_sizes.items():
-        total = sum(sizes.values())
+        total = sum(sizes.values()) if isinstance(sizes, dict) else sum(sizes.values())
         if total == 0:
             bt = 3
         else:
-            n_buckets = len([v for v in sizes.values() if v > 0])
-            top_frac = max(sizes.values()) / total
+            n_buckets = len([v for v in sizes.values() if v > 0]) if isinstance(sizes, dict) else 0
+            top_frac = max(sizes.values()) / total if isinstance(sizes, dict) else 0
             if top_frac >= 0.9 and n_buckets <= 2:
                 bt = 0  # mono
             elif n_buckets <= 3:
@@ -175,7 +186,6 @@ def build_call_site_profiles(normal_events_all):
                 bt = 2  # broad
         profiles[cs] = {"behavior_type": bt, "total_count": total}
 
-    # Frequency rank: top 5% = rank 0, p80 = rank 1, p50 = rank 2, rest = rank 3
     counts = sorted(cs_count.values())
     if counts:
         p50 = float(np.percentile(counts, 50))
@@ -198,21 +208,11 @@ def build_call_site_profiles(normal_events_all):
     return profiles, {"p50": p50, "p80": p80, "p95": p95}
 
 
-def calibrate_dt_thresholds(normal_events_all):
-    """Compute dt distribution from normal runs, return fixed thresholds."""
-    dts_us = []
-    for events in normal_events_all:
-        prev_ts = None
-        for event in events:
-            if prev_ts is not None:
-                dt_us = (event["timestamp_ns"] - prev_ts) / 1000.0
-                if dt_us >= 0:
-                    dts_us.append(dt_us)
-            prev_ts = event["timestamp_ns"]
-    if not dts_us:
-        return list(DT_THRESHOLDS_US)
-    d = np.array(dts_us)
-    # Use fixed thresholds (2/50/1000 us) - validated stable across CVEs
+def calibrate_dt_thresholds():
+    """Return fixed dt bucket thresholds (microseconds).
+
+    Validated stable across CVEs on kernel 4.15: 2/50/1000 us.
+    """
     return list(DT_THRESHOLDS_US)
 
 
@@ -316,6 +316,52 @@ def cut_sequences(tokens, event_labels, run_id, seq_len=SEQ_LEN, stride=STRIDE):
 
 
 # ---------------------------------------------------------------------------
+# Multiprocessing workers (top-level for picklability)
+# ---------------------------------------------------------------------------
+
+# Global profiles set once per worker process via Pool initializer
+_worker_profiles = None
+
+
+def _init_token_worker(profiles):
+    """Initializer for tokenization workers — set global profiles once per process."""
+    global _worker_profiles
+    _worker_profiles = profiles
+
+
+def _collect_stats_worker(trace_path):
+    """Parse one trace.log and return call_site size stats (for profile building)."""
+    events, _ = parse_trace_log(trace_path)
+    cs_sizes = {}
+    cs_count = {}
+    for event in events:
+        if event["op"] == "ALLOC":
+            cs = event.get("call_site", "")
+            size = event.get("bytes_alloc", 0) or event.get("bytes_req", 0)
+            idx = bucket_index(size) if size else 0
+            if cs not in cs_sizes:
+                cs_sizes[cs] = {}
+            cs_sizes[cs][idx] = cs_sizes[cs].get(idx, 0) + 1
+            cs_count[cs] = cs_count.get(cs, 0) + 1
+    return cs_sizes, cs_count
+
+
+def _tokenize_run_worker(task):
+    """Parse + tokenize one run. Returns (cls, seqs, seq_labels, seq_ids) or None."""
+    run_id, cls, trace_path, spray_window, seq_len, stride = task
+    events, _ = parse_trace_log(trace_path)
+    if not events:
+        return None
+    spray_start = spray_window.get("SPRAY_START")
+    spray_end = spray_window.get("SPRAY_END")
+    tokens, event_labels = tokenize_run(events, _worker_profiles, spray_start, spray_end)
+    seqs, seq_labels, seq_ids = cut_sequences(tokens, event_labels, run_id, seq_len, stride)
+    if not seqs:
+        return None
+    return cls, seqs, seq_labels, seq_ids
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -330,6 +376,9 @@ def main():
     parser.add_argument("--stride", type=int, default=STRIDE)
     parser.add_argument("--force", action="store_true",
                         help="allow overwriting existing output")
+    parser.add_argument("--workers", type=int,
+                        default=max(1, int((os.cpu_count() or 1) * 0.8)),
+                        help="number of parallel workers")
     args = parser.parse_args()
 
     raw_dir = Path(args.raw)
@@ -345,44 +394,62 @@ def main():
         parser.error(f"no valid runs found in {raw_dir}")
     log.info("discovered %d valid runs", len(runs))
 
-    # ---- 1. Parse all trace.log files ----
-    run_data = {}  # run_id -> (class, events, markers, spray_window)
-    normal_events_all = []
-    for run_id, cls, trace_path, run_dir in runs:
-        events, markers = parse_trace_log(trace_path)
-        if not events:
-            log.warning("%s: no events", run_id)
-            continue
-        spray_window = markers or manifest_spray_window(run_dir)
-        run_data[run_id] = (cls, events, spray_window)
-        if cls == "normal":
-            normal_events_all.append(events)
+    normal_paths = [trace_path for _, cls, trace_path, _ in runs if cls == "normal"]
 
-    log.info("parsed %d runs (%d normal, %d attack)",
-             len(run_data),
-             sum(1 for v in run_data.values() if v[0] == "normal"),
-             sum(1 for v in run_data.values() if v[0] == "attack"))
+    # ---- 1. Collect call_site stats from normal runs (parallel) ----
+    workers = min(args.workers, len(runs))
+    if workers > 1 and len(normal_paths) > 1:
+        log.info("Collecting call_site stats from %d normal runs with %d workers",
+                 len(normal_paths), min(workers, len(normal_paths)))
+        with multiprocessing.Pool(min(workers, len(normal_paths))) as pool:
+            stats_results = pool.map(_collect_stats_worker, normal_paths)
+    else:
+        stats_results = [_collect_stats_worker(p) for p in normal_paths]
 
-    # ---- 2. Build call_site profiles from normal data ----
-    profiles, freq_thresholds = build_call_site_profiles(normal_events_all)
-    dt_thresholds = calibrate_dt_thresholds(normal_events_all)
+    # Merge stats
+    merged_cs_sizes = defaultdict(Counter)
+    merged_cs_count = Counter()
+    for cs_sizes, cs_count in stats_results:
+        for cs, sizes in cs_sizes.items():
+            for idx, cnt in sizes.items():
+                merged_cs_sizes[cs][idx] += cnt
+        for cs, cnt in cs_count.items():
+            merged_cs_count[cs] += cnt
+
+    # ---- 2. Build call_site profiles (sequential, fast) ----
+    profiles, freq_thresholds = build_call_site_profiles_from_stats(
+        dict(merged_cs_sizes), dict(merged_cs_count))
+    dt_thresholds = calibrate_dt_thresholds()
     log.info("call_site profiles: %d entries (p50=%.0f p80=%.0f p95=%.0f)",
              len(profiles), freq_thresholds["p50"], freq_thresholds["p80"],
              freq_thresholds["p95"])
 
-    # ---- 3. Tokenize + cut sequences for each run ----
+    # ---- 3. Tokenize + cut sequences for each run (parallel) ----
+    # Prepare tasks: each worker parses + tokenizes one run
+    tasks = []
+    for run_id, cls, trace_path, run_dir in runs:
+        spray_window = manifest_spray_window(run_dir)
+        if not spray_window:
+            # Fallback: parse markers from trace.log (will be parsed again in worker)
+            _, markers = parse_trace_log(trace_path)
+            spray_window = markers
+        tasks.append((run_id, cls, trace_path, spray_window, args.seq_len, args.stride))
+
+    if workers > 1 and len(tasks) > 1:
+        log.info("Tokenizing %d runs with %d workers", len(tasks), workers)
+        with multiprocessing.Pool(workers, initializer=_init_token_worker,
+                                  initargs=(profiles,)) as pool:
+            results = pool.map(_tokenize_run_worker, tasks)
+    else:
+        _init_token_worker(profiles)
+        results = [_tokenize_run_worker(t) for t in tasks]
+
     attack_seqs, attack_labels, attack_ids = [], [], []
     normal_seqs, normal_labels, normal_ids = [], [], []
-
-    for run_id, (cls, events, spray_window) in sorted(run_data.items()):
-        spray_start = spray_window.get("SPRAY_START")
-        spray_end = spray_window.get("SPRAY_END")
-        tokens, event_labels = tokenize_run(events, profiles, spray_start, spray_end)
-        seqs, seq_lbls, seq_rids = cut_sequences(
-            tokens, event_labels, run_id, args.seq_len, args.stride)
-        if not seqs:
-            log.warning("%s: too few events (%d) for seq_len=%d", run_id, len(tokens), args.seq_len)
+    for result in results:
+        if result is None:
             continue
+        cls, seqs, seq_lbls, seq_rids = result
         if cls == "attack":
             attack_seqs.extend(seqs)
             attack_labels.extend(seq_lbls)

@@ -5,6 +5,7 @@ import os
 import json
 import argparse
 import logging
+import multiprocessing
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("trace2csv")
@@ -100,6 +101,11 @@ def parse_bpftrace_line(line):
     return None
 
 
+def _convert_file_worker(in_path, out_path):
+    """Multiprocessing wrapper for convert_file (must be top-level to be picklable)."""
+    return convert_file(in_path, out_path)
+
+
 def detect_format(filepath):
     with open(filepath, "r", errors="replace") as f:
         for line in f:
@@ -178,6 +184,9 @@ def main():
     parser = argparse.ArgumentParser(description="Convert ftrace/bpftrace logs to CSV")
     parser.add_argument("-i", "--input", required=True, help="Input .log file or directory")
     parser.add_argument("-o", "--output", required=True, help="Output .csv file or directory")
+    parser.add_argument("--workers", type=int,
+                        default=max(1, int((os.cpu_count() or 1) * 0.8)),
+                        help="number of parallel workers for directory mode")
     args = parser.parse_args()
 
     all_markers = {}
@@ -193,35 +202,56 @@ def main():
             all_markers[os.path.basename(args.input)] = markers
     elif os.path.isdir(args.input):
         os.makedirs(args.output, exist_ok=True)
-        total = 0
-        file_count = 0
+        # Phase 1: walk directory, check manifests, collect tasks
+        tasks = []  # [(in_path, out_path, rel_path, manifest_window)]
         for dirpath, _, filenames in os.walk(args.input):
             rel = os.path.relpath(dirpath, args.input)
             out_dir = os.path.join(args.output, rel) if rel != "." else args.output
             os.makedirs(out_dir, exist_ok=True)
-            # Plan 6.1: preprocessing only reads runs the collector marked valid.
             status = manifest_status(dirpath)
             if status is not None and status != "valid":
                 log.info("  skipping invalid run %s (status=%s)", dirpath, status)
                 continue
-            # The collector manifest (if any) is the authoritative spray window.
             manifest_window = manifest_spray_window(dirpath)
             for fname in sorted(filenames):
                 if not fname.endswith(".log"):
                     continue
                 in_path = os.path.join(dirpath, fname)
                 out_path = os.path.join(out_dir, fname.replace(".log", ".csv"))
-                n, markers = convert_file(in_path, out_path)
+                rel_path = os.path.relpath(in_path, args.input)
+                tasks.append((in_path, out_path, rel_path, manifest_window))
+
+        # Phase 2: process files in parallel (or sequential if 1 worker)
+        total = 0
+        file_count = 0
+        workers = min(args.workers, len(tasks)) if tasks else 1
+        if workers > 1 and len(tasks) > 1:
+            log.info("Processing %d files with %d workers", len(tasks), workers)
+            with multiprocessing.Pool(workers) as pool:
+                results = pool.starmap(_convert_file_worker,
+                                       [(t[0], t[1]) for t in tasks])
+            for (n, markers), (in_path, out_path, rel_path, manifest_window) in zip(results, tasks):
                 if n is None:
-                    continue  # non-trace file (e.g. qemu.log); no CSV produced
+                    continue
                 total += n
                 file_count += 1
-                rel_path = os.path.relpath(in_path, args.input)
-                log.info("  %s: %d events", rel_path, n)
                 if manifest_window:
                     markers = dict(manifest_window)
                 if markers:
                     all_markers[rel_path] = markers
+                log.info("  %s: %d events", rel_path, n)
+        else:
+            for in_path, out_path, rel_path, manifest_window in tasks:
+                n, markers = convert_file(in_path, out_path)
+                if n is None:
+                    continue
+                total += n
+                file_count += 1
+                if manifest_window:
+                    markers = dict(manifest_window)
+                if markers:
+                    all_markers[rel_path] = markers
+                log.info("  %s: %d events", rel_path, n)
         log.info("Total: %d events from %d files", total, file_count)
     else:
         log.error("Input not found: %s", args.input)
