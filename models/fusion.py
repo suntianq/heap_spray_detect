@@ -157,7 +157,11 @@ class FusionDetector:
                                     "seed": self.gru.seed}},
                 "ocsvm": {"model": self.ocsvm.model,
                            "mean": self.ocsvm.mean,
-                           "std": self.ocsvm.std},
+                           "std": self.ocsvm.std,
+                           "kernel": self.ocsvm.kernel,
+                           "nu": self.ocsvm.nu,
+                           "gamma": self.ocsvm.gamma,
+                           "backend": self.ocsvm.backend},
                 "gru_val_scores": self.gru_val_scores,
                 "ocsvm_val_scores": self.ocsvm_val_scores,
                 "config": {"w_gru": self.w_gru, "w_ocsvm": self.w_ocsvm,
@@ -170,16 +174,19 @@ class FusionDetector:
             data = pickle.load(f)
         cfg = data["config"]
         gru_cfg = data["gru"]["config"]
-        ocs_cfg = {"kernel": "rbf", "nu": 0.05, "gamma": "scale"}
+        oc = data["ocsvm"]
+        ocs_cfg = {"kernel": oc.get("kernel", "rbf"), "nu": oc.get("nu", 0.05),
+                   "gamma": oc.get("gamma", "scale")}
         obj = cls(seed=cfg["seed"], gru_config=gru_cfg, ocsvm_config=ocs_cfg,
                   w_gru=cfg["w_gru"], w_ocsvm=cfg["w_ocsvm"])
         if data["gru"]["net_state"] is not None:
             obj.gru.net = obj.gru._make_net()
             obj.gru.net.load_state_dict(data["gru"]["net_state"])
             obj.gru.net.eval()
-        obj.ocsvm.model = data["ocsvm"]["model"]
-        obj.ocsvm.mean = data["ocsvm"]["mean"]
-        obj.ocsvm.std = data["ocsvm"]["std"]
+        obj.ocsvm.model = oc["model"]
+        obj.ocsvm.mean = oc["mean"]
+        obj.ocsvm.std = oc["std"]
+        obj.ocsvm.backend = oc.get("backend", obj.ocsvm.backend)
         obj.gru_val_scores = data["gru_val_scores"]
         obj.ocsvm_val_scores = data["ocsvm_val_scores"]
         return obj
