@@ -94,15 +94,17 @@ class GRUDetector:
         optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
         self.net.train()
 
-        for epoch in range(self.epochs):
+        from tqdm import tqdm
+        epoch_pbar = tqdm(range(self.epochs), desc="GRU training", unit="epoch",
+                          leave=True)
+        for epoch in epoch_pbar:
             total_loss = 0.0
             n_batches = 0
             for (xb,) in loader:
                 xb = xb.to(device)
-                # input = tokens[:-1], target = tokens[1:]
                 inp = xb[:, :-1]
                 tgt = xb[:, 1:]
-                logits = self.net(inp)  # (B, L-1, vocab)
+                logits = self.net(inp)
                 loss = F.cross_entropy(
                     logits.reshape(-1, self.vocab_size), tgt.reshape(-1))
                 optimizer.zero_grad()
@@ -112,11 +114,8 @@ class GRUDetector:
                 total_loss += loss.item()
                 n_batches += 1
             avg_loss = total_loss / max(n_batches, 1)
-            log_msg = f"  epoch {epoch+1}/{self.epochs} loss={avg_loss:.4f}"
-            if (epoch + 1) % 5 == 0 or epoch == 0:
-                import logging
-                logging.getLogger("gru_detector").info(log_msg)
-
+            epoch_pbar.set_postfix(loss=f"{avg_loss:.4f}")
+        epoch_pbar.close()
         self.net.eval()
         return self
 
@@ -138,9 +137,10 @@ class GRUDetector:
         dataset = TensorDataset(x)
         loader = DataLoader(dataset, batch_size=batch, shuffle=False)
 
+        from tqdm import tqdm
         all_violations = []
         with torch.no_grad():
-            for (xb,) in loader:
+            for (xb,) in tqdm(loader, desc="GRU scoring", unit="batch", leave=True):
                 xb = xb.to(device)
                 inp = xb[:, :-1]
                 tgt = xb[:, 1:]

@@ -158,7 +158,8 @@ class TorchAEWrapper:
         optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
         loader = DataLoader(TensorDataset(x, x), batch_size=batch_size, shuffle=True)
         self.net.train()
-        for _ in range(self.epochs):
+        from tqdm import tqdm
+        for _ in tqdm(range(self.epochs), desc=f"{self.model_kind} training", unit="epoch", leave=True):
             for xb, yb in loader:
                 if mean_t is not None:  # apply frozen train stats per batch
                     xb = (xb - mean_t) / std_t

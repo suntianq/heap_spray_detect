@@ -159,8 +159,12 @@ def score_sequences_batched(model, sequences, aggregation, batch=4096):
     count = int(sequences.shape[0])
     if count <= batch:
         return score_sequences(model, sequences, aggregation)
-    parts = [score_sequences(model, sequences[i:i + batch], aggregation)
-             for i in range(0, count, batch)]
+    from tqdm import tqdm
+    n_chunks = (count + batch - 1) // batch
+    parts = []
+    for i in tqdm(range(0, count, batch), total=n_chunks,
+                  desc="scoring", unit="chunk", leave=True):
+        parts.append(score_sequences(model, sequences[i:i + batch], aggregation))
     return np.concatenate(parts)
 
 
@@ -179,9 +183,13 @@ def score_sequences_masked(model, base_sequences, mask, aggregation, batch=4096)
     dtype = np.int32 if base_sequences.dtype == np.int32 else np.float32
     if count <= batch:
         return score_sequences(model, base_sequences[idx].astype(dtype), aggregation)
-    parts = [score_sequences(model, base_sequences[idx[i:i + batch]].astype(dtype),
-                             aggregation)
-             for i in range(0, count, batch)]
+    from tqdm import tqdm
+    n_chunks = (count + batch - 1) // batch
+    parts = []
+    for i in tqdm(range(0, count, batch), total=n_chunks,
+                  desc="scoring", unit="chunk", leave=True):
+        parts.append(score_sequences(model, base_sequences[idx[i:i + batch]].astype(dtype),
+                                     aggregation))
     return np.concatenate(parts)
 
 
