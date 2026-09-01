@@ -15,7 +15,12 @@ python3 -m venv .venv
 
 ```bash
 pip install torch scikit-learn scipy numpy matplotlib pandas
+# 可选：OCSVM 的 GPU 加速后端（装了自动启用，未装回落 sklearn）
+pip install thundersvm
 ```
+
+ocsvm 后端自动选择：检测到 `thundersvm` 时用 CUDA 加速 OneClassSVM，
+否则用 sklearn（CPU）。可用环境变量 `HEAPSPRAY_SVM_BACKEND=sklearn` 强制 CPU。
 
 GPU 自动检测：`torch.cuda.is_available()` → CUDA / CPU 自动切换，无需手动配置。
 

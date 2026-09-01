@@ -1,5 +1,5 @@
+import os
 import numpy as np
-from sklearn.svm import OneClassSVM
 import pickle
 import logging
 
@@ -10,11 +10,62 @@ log = logging.getLogger("ocsvm")
 _SCORE_BATCH = 65536
 
 
+def _resolve_backend():
+    """Resolve SVM backend: ThunderSVM (GPU) when available, else sklearn.
+
+    ThunderSVM provides a sklearn-compatible OneClassSVM that runs on CUDA.
+    Set env HEAPSPRAY_SVM_BACKEND=sklearn to force the CPU backend even when
+    ThunderSVM is installed.
+    """
+    forced = os.environ.get("HEAPSPRAY_SVM_BACKEND", "").strip().lower()
+    if forced in ("sklearn", "cpu"):
+        return "sklearn"
+    try:
+        import thundersvm  # noqa: F401
+        return "thundersvm"
+    except ImportError:
+        return "sklearn"
+
+
+def _make_model(kernel, nu, gamma, backend):
+    if backend == "thundersvm":
+        from thundersvm import OneClassSVM
+        return OneClassSVM(kernel=kernel, nu=nu, gamma=gamma, verbose=False)
+    from sklearn.svm import OneClassSVM
+    return OneClassSVM(kernel=kernel, nu=nu, gamma=gamma)
+
+
 class OCSVMDetector:
+    """One-Class SVM detector with automatic GPU backend.
+
+    Backend selection at fit time: thundersvm (CUDA) if installed, else
+    sklearn (CPU). gamma='scale' is resolved to its numeric value so both
+    backends compute identical kernels.
+    """
+
     def __init__(self, kernel="rbf", nu=0.05, gamma="scale"):
-        self.model = OneClassSVM(kernel=kernel, nu=nu, gamma=gamma)
+        self.kernel = kernel
+        self.nu = nu
+        self.gamma = gamma
+        self.backend = _resolve_backend()
+        self.model = None
         self.mean = None
         self.std = None
+
+    def _effective_gamma(self, X):
+        """Resolve string gamma to numeric (ThunderSVM requires a float).
+
+        'scale' = 1 / (n_features * X.var()), matching sklearn semantics.
+        """
+        g = self.gamma
+        if isinstance(g, str):
+            if g == "scale":
+                var = float(X.var())
+                return 1.0 / (X.shape[1] * var) if var > 0 else 1.0
+            if g == "auto":
+                return 1.0 / X.shape[1]
+            raise ValueError(f"unsupported gamma: {g!r}")
+        return float(g)
 
     def fit(self, features, labels=None):
         if labels is not None:
@@ -28,23 +79,38 @@ class OCSVMDetector:
         self.std[self.std < 1e-8] = 1.0
 
         norm_feats = (features - self.mean) / self.std
-        log.info("ocsvm fit: %d samples, %d features", norm_feats.shape[0], norm_feats.shape[1])
+        gamma = self._effective_gamma(norm_feats)
+        self.model = _make_model(self.kernel, self.nu, gamma, self.backend)
+        log.info("ocsvm fit: backend=%s %d samples, %d features",
+                 self.backend, norm_feats.shape[0], norm_feats.shape[1])
         self.model.fit(norm_feats)
         log.info("ocsvm fit done")
         return self
+
+    def _score_samples(self, X):
+        """score_samples with backend fallback.
+
+        ThunderSVM may not implement score_samples; decision_function differs
+        only by a constant offset (offset_), which is monotonic-equivalent:
+        AUC ranking is unchanged and the p99 threshold is calibrated on the
+        same backend's scores, so the constant shift is absorbed.
+        """
+        if hasattr(self.model, "score_samples"):
+            return self.model.score_samples(X)
+        return self.model.decision_function(X)
 
     def anomaly_score(self, features):
         norm_feats = (features - self.mean) / self.std
         n = len(norm_feats)
         if n <= _SCORE_BATCH:
-            return -self.model.score_samples(norm_feats)
+            return -self._score_samples(norm_feats)
         # Chunk to show progress on large eval sets
         from tqdm import tqdm
         chunks = range(0, n, _SCORE_BATCH)
         parts = []
         for i in tqdm(chunks, total=(n + _SCORE_BATCH - 1) // _SCORE_BATCH,
-                      desc="ocsvm scoring", unit="chunk", leave=True):
-            parts.append(-self.model.score_samples(norm_feats[i:i + _SCORE_BATCH]))
+                      desc=f"ocsvm scoring ({self.backend})", unit="chunk", leave=True):
+            parts.append(-self._score_samples(norm_feats[i:i + _SCORE_BATCH]))
         return np.concatenate(parts)
 
     def loss_function(self, *args, **kwargs):
@@ -52,13 +118,17 @@ class OCSVMDetector:
 
     def save(self, path):
         with open(path, "wb") as f:
-            pickle.dump({"model": self.model, "mean": self.mean, "std": self.std}, f)
+            pickle.dump({"model": self.model, "mean": self.mean, "std": self.std,
+                         "kernel": self.kernel, "nu": self.nu, "gamma": self.gamma,
+                         "backend": self.backend}, f)
 
     @classmethod
     def load(cls, path):
         with open(path, "rb") as f:
             data = pickle.load(f)
-        obj = cls()
+        obj = cls(kernel=data.get("kernel", "rbf"), nu=data.get("nu", 0.05),
+                  gamma=data.get("gamma", "scale"))
+        obj.backend = data.get("backend", obj.backend)
         obj.model = data["model"]
         obj.mean = data["mean"]
         obj.std = data["std"]
