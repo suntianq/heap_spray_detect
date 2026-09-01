@@ -44,7 +44,7 @@ class GRUDetector:
     harness aggregates via "mean" (violation rate per sequence).
     """
 
-    def __init__(self, seed=42, vocab_size=1536, d_model=128, n_layers=2,
+    def __init__(self, seed=42, vocab_size=13824, d_model=128, n_layers=2,
                  dropout=0.1, lr=1e-3, epochs=20, batch_size=256, g=10,
                  device=None):
         self.seed = seed

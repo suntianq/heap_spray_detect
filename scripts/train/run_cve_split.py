@@ -77,10 +77,10 @@ MODEL_CONFIG = {
     "lstm_vae": {"hidden_dim": 64, "latent_dim": 16, "num_layers": 2, "epochs": 25,
                  "lr": 1e-3, "beta": 1.0},
     "gru": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3, "g": 10,
-            "vocab_size": 1536},
+            "vocab_size": 13824},
     "fusion_svdd": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3,
                     "g": 10, "svdd_loss_weight": 0.1, "svdd_score_weight": 0.3,
-                    "vocab_size": 1536},
+                    "vocab_size": 13824},
 }
 
 TOKEN_MODELS = {"gru", "fusion_svdd"}

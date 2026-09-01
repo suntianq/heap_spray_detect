@@ -123,11 +123,13 @@ class TestTokenEncoding(unittest.TestCase):
                 for bt in range(4):
                     for fr in range(4):
                         for dt in range(4):
-                            tid = encode_token(op, sb, bt, fr, dt)
-                            self.assertNotIn(tid, seen, f"collision at ({op},{sb},{bt},{fr},{dt})")
-                            seen.add(tid)
-        self.assertEqual(len(seen), 2 * 12 * 4 * 4 * 4)
-        self.assertEqual(max(seen), 1535)
+                            for cpu_b in range(3):
+                                for reclaim in range(3):
+                                    tid = encode_token(op, sb, bt, fr, dt, cpu_b, reclaim)
+                                    self.assertNotIn(tid, seen, f"collision at ({op},{sb},{bt},{fr},{dt},{cpu_b},{reclaim})")
+                                    seen.add(tid)
+        self.assertEqual(len(seen), 2 * 12 * 4 * 4 * 4 * 3 * 3)
+        self.assertEqual(max(seen), 13823)
         self.assertEqual(min(seen), 0)
 
 

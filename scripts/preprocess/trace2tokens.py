@@ -47,7 +47,7 @@ from scripts.common.io import write_json_atomic, snapshot_git_revision
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("trace2tokens")
 
-VOCAB_SIZE = 2 * 12 * 4 * 4 * 4  # 1536
+VOCAB_SIZE = 2 * 12 * 4 * 4 * 4 * 3 * 3  # 13824 (7-tuple: op, size, behavior, freq, dt, cpu, reclaim)
 SEQ_LEN = 128
 STRIDE = SEQ_LEN // 2  # 50% overlap
 
@@ -233,13 +233,62 @@ def dt_to_bucket(dt_ns):
         return 3
 
 
-def encode_token(op, size_bucket, behavior_type, frequency_rank, dt_bucket):
-    """Encode 5-tuple as single int token_id (0..1535)."""
-    return (op * 12 * 4 * 4 * 4 +
-            size_bucket * 4 * 4 * 4 +
-            behavior_type * 4 * 4 +
-            frequency_rank * 4 +
-            dt_bucket)
+def encode_token(op, size_bucket, behavior_type, frequency_rank, dt_bucket, cpu_bucket, reclaim_flag):
+    """Encode 7-tuple as single int token_id (0..3455).
+
+    Fields:
+      op:             0=ALLOC, 1=FREE                         (2)
+      size_bucket:    0-11 (32,64,...,8192,gt)                (12)
+      behavior_type:  0=mono, 1=narrow, 2=broad, 3=unknown    (4)
+      frequency_rank: 0-3 (top5%, p80, p50, rare)            (4)
+      dt_bucket:      0-3 (<2us, 2-50us, 50-1ms, >1ms)       (4)
+      cpu_bucket:     0=dominant, 1=moderate, 2=spread       (3)
+      reclaim_flag:   0=none, 1=same-site, 2=cross-site      (3)
+    """
+    return (op * 12 * 4 * 4 * 4 * 3 * 3 +
+            size_bucket * 4 * 4 * 4 * 3 * 3 +
+            behavior_type * 4 * 4 * 3 * 3 +
+            frequency_rank * 4 * 3 * 3 +
+            dt_bucket * 3 * 3 +
+            cpu_bucket * 3 +
+            reclaim_flag)
+
+
+def _compute_cpu_buckets(events, window=32):
+    """Compute per-event CPU concentration bucket.
+
+    For each event, look at the last `window` events and compute what fraction
+    are on the same CPU as the current event:
+      0 = dominant (>70% same CPU — spray is CPU-pinned)
+      1 = moderate (30-70%)
+      2 = spread (<30% — normal load distributes across cores)
+
+    Returns a list of cpu_bucket values, one per event.
+    """
+    n = len(events)
+    buckets = [2] * n  # default: spread
+    cpu_history = []  # list of CPU IDs in sliding window
+
+    for i in range(n):
+        cpu = events[i].get("cpu", 0)
+        cpu_history.append(cpu)
+        if len(cpu_history) > window:
+            cpu_history = cpu_history[-window:]
+
+        if len(cpu_history) <= 1:
+            buckets[i] = 0  # first event: trivially dominant
+            continue
+
+        same_count = sum(1 for c in cpu_history if c == cpu)
+        ratio = same_count / len(cpu_history)
+        if ratio > 0.7:
+            buckets[i] = 0  # dominant
+        elif ratio > 0.3:
+            buckets[i] = 1  # moderate
+        else:
+            buckets[i] = 2  # spread
+
+    return buckets
 
 
 def tokenize_run(events, profiles, spray_start=None, spray_end=None):
@@ -249,11 +298,12 @@ def tokenize_run(events, profiles, spray_start=None, spray_end=None):
     event_labels is list[int] (1 if in spray window, 0 otherwise).
     """
     resolve_free_sizes(events)
+    cpu_buckets = _compute_cpu_buckets(events)
     tokens = []
     event_labels = []
     prev_ts = None
 
-    for event in events:
+    for i, event in enumerate(events):
         op = 0 if event["op"] == "ALLOC" else 1
         if event["op"] == "ALLOC":
             size = event.get("resolved_size") or event.get("bytes_alloc", 0) or event.get("bytes_req", 0)
@@ -275,7 +325,17 @@ def tokenize_run(events, profiles, spray_start=None, spray_end=None):
             dt = 3
         prev_ts = event["timestamp_ns"]
 
-        tokens.append(encode_token(op, sb, bt, fr, dt))
+        cpu_b = cpu_buckets[i]
+
+        # reclaim_flag: from resolve_free_sizes annotations
+        if event.get("reclaim_cross_site", False):
+            reclaim_flag = 2  # cross-site reclaim (UAF fingerprint)
+        elif event.get("reclaim_from_free", False):
+            reclaim_flag = 1  # same-site reclaim
+        else:
+            reclaim_flag = 0  # not a reclaim
+
+        tokens.append(encode_token(op, sb, bt, fr, dt, cpu_b, reclaim_flag))
 
         if spray_start is not None and spray_end is not None:
             event_labels.append(1 if spray_start <= event["timestamp_ns"] <= spray_end else 0)
@@ -507,8 +567,9 @@ def main():
         "seq_len": args.seq_len,
         "stride": args.stride,
         "vocab_size": VOCAB_SIZE,
-        "token_fields": ["op", "size_bucket", "behavior_type", "frequency_rank", "dt_bucket"],
-        "token_field_sizes": [2, 12, 4, 4, 4],
+        "token_fields": ["op", "size_bucket", "behavior_type", "frequency_rank",
+                         "dt_bucket", "cpu_bucket", "reclaim_flag"],
+        "token_field_sizes": [2, 12, 4, 4, 4, 3, 3],
         "call_site_profiles": {
             cs: {"behavior_type": p["behavior_type"],
                  "frequency_rank": p["frequency_rank"],
