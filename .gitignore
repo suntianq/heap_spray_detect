@@ -10,7 +10,6 @@ __pycache__/
 # ---- 采集数据（大，不入库）----
 # 11G 原始/CSV/processed 数据，含 QEMU 镜像、trace、manifest
 datasets/
-data/
 
 # ---- 实验结果 / 模型产物 ----
 runs/
