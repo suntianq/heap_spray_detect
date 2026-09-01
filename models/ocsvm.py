@@ -10,20 +10,33 @@ log = logging.getLogger("ocsvm")
 _SCORE_BATCH = 65536
 
 
+def _probe_thundersvm():
+    """Import probe for ThunderSVM.
+
+    Any failure means unavailable: ImportError (not installed) or OSError
+    (installed but broken, e.g. wheel built against an older CUDA than the
+    host's, missing libcusparse/libcublas .so).
+    """
+    import thundersvm  # noqa: F401
+
+
 def _resolve_backend():
     """Resolve SVM backend: ThunderSVM (GPU) when available, else sklearn.
 
     ThunderSVM provides a sklearn-compatible OneClassSVM that runs on CUDA.
     Set env HEAPSPRAY_SVM_BACKEND=sklearn to force the CPU backend even when
-    ThunderSVM is installed.
+    ThunderSVM is installed. A broken ThunderSVM install (CUDA lib mismatch)
+    also falls back to sklearn instead of crashing the run.
     """
     forced = os.environ.get("HEAPSPRAY_SVM_BACKEND", "").strip().lower()
     if forced in ("sklearn", "cpu"):
         return "sklearn"
     try:
-        import thundersvm  # noqa: F401
+        _probe_thundersvm()
         return "thundersvm"
-    except ImportError:
+    except Exception as error:
+        log.warning("thundersvm unavailable (%s: %s); using sklearn CPU backend",
+                    type(error).__name__, error)
         return "sklearn"
 
 

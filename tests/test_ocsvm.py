@@ -30,6 +30,29 @@ class TestBackendResolution(unittest.TestCase):
     def test_backend_is_valid(self):
         self.assertIn(_resolve_backend(), ("sklearn", "thundersvm"))
 
+    def test_broken_install_falls_back(self):
+        """Thundersvm installed but broken (e.g. missing libcusparse) must
+        fall back to sklearn, not crash the run."""
+        from unittest import mock
+        import models.ocsvm as ocsvm_mod
+        with mock.patch.object(ocsvm_mod, "_probe_thundersvm",
+                               side_effect=OSError(
+                                   "libcusparse.so.9.0: cannot open shared object file")):
+            self.assertEqual(ocsvm_mod._resolve_backend(), "sklearn")
+
+    def test_import_error_falls_back(self):
+        from unittest import mock
+        import models.ocsvm as ocsvm_mod
+        with mock.patch.object(ocsvm_mod, "_probe_thundersvm",
+                               side_effect=ImportError("No module named 'thundersvm'")):
+            self.assertEqual(ocsvm_mod._resolve_backend(), "sklearn")
+
+    def test_working_thundersvm_selected(self):
+        from unittest import mock
+        import models.ocsvm as ocsvm_mod
+        with mock.patch.object(ocsvm_mod, "_probe_thundersvm"):
+            self.assertEqual(ocsvm_mod._resolve_backend(), "thundersvm")
+
     def test_make_model_returns_fitted_api(self):
         backend = _resolve_backend()
         model = _make_model("rbf", 0.05, 0.1, backend)
