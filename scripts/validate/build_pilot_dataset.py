@@ -33,6 +33,7 @@ import os
 import shutil
 import subprocess
 import sys
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +42,10 @@ SCRIPTS = ROOT / "scripts"
 TRACE2CSV = SCRIPTS / "preprocess" / "trace2csv.py"
 CSV2FEATURES = SCRIPTS / "preprocess" / "csv2features.py"
 PILOT_GATES = SCRIPTS / "validate" / "pilot_gates.py"
+
+# Use the same interpreter that launched this script (e.g. .venv/bin/python3)
+# so subprocesses have access to the same installed libraries.
+PYTHON = sys.executable
 
 # csv2features v2 defaults (plan 5.5): 100ms window / 50ms stride / 32 seq.
 WINDOW_MS = 100
@@ -246,22 +251,22 @@ def main():
         clear_dir(d)
 
     # trace2csv on the whole raw root mirrors <CVE>/{attack,normal,baseline}/...
-    run(["python3", TRACE2CSV, "-i", args.raw, "-o", csv_all])
+    run([PYTHON, TRACE2CSV, "-i", args.raw, "-o", csv_all])
     _split_class_csv(csv_all, csv_attack, csv_normal)
 
     # Baseline PoCs are negative samples; they merge into the normal CSV set.
     meta_path = build_run_meta(csv_normal)
 
-    run(["python3", CSV2FEATURES, "-i", csv_attack, "-o", proc_attack,
+    run([PYTHON, CSV2FEATURES, "-i", csv_attack, "-o", proc_attack,
          "-w", WINDOW_MS, "-s", STRIDE_MS, "--seq-len", SEQ_LEN,
          "--is-attack", "--markers", csv_attack / "spray_markers.json",
          "--sequence-label", "any", "--force"])
-    run(["python3", CSV2FEATURES, "-i", csv_normal, "-o", proc_normal,
+    run([PYTHON, CSV2FEATURES, "-i", csv_normal, "-o", proc_normal,
          "-w", WINDOW_MS, "-s", STRIDE_MS, "--seq-len", SEQ_LEN,
          "--run-meta", meta_path, "--force"])
 
     if not args.skip_gates:
-        run(["python3", PILOT_GATES, "--attack", proc_attack, "--normal", proc_normal])
+        run([PYTHON, PILOT_GATES, "--attack", proc_attack, "--normal", proc_normal])
     else:
         print("SKIP: pilot_gates (--skip-gates)")
 
