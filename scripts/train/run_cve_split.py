@@ -40,6 +40,8 @@ import config  # noqa: E402
 from models import (IsolationForestDetector, LOFDetector, OCSVMDetector,  # noqa: E402
                     PCADetector, StatisticalThresholdDetector, TorchAEWrapper)
 from models.gru_detector import GRUDetector  # noqa: E402
+from models.fusion import FusionDetector  # noqa: E402
+from models.fusion_svdd import FusionSVDDDetector  # noqa: E402
 from scripts.train import common  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -59,6 +61,9 @@ MODEL_FACTORY = {
     "lstm_vae": lambda seed: TorchAEWrapper("lstm_vae", seed=seed,
                                             epochs=25, seq_batch_size=64, beta=1.0),
     "gru": lambda seed: GRUDetector(seed=seed, epochs=20, batch_size=256, g=10),
+    "fusion_svdd": lambda seed: FusionSVDDDetector(
+        seed=seed, epochs=20, batch_size=256, g=10,
+        svdd_loss_weight=0.1, svdd_score_weight=0.3),
 }
 
 MODEL_CONFIG = {
@@ -73,10 +78,13 @@ MODEL_CONFIG = {
                  "lr": 1e-3, "beta": 1.0},
     "gru": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3, "g": 10,
             "vocab_size": 1536},
+    "fusion_svdd": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3,
+                    "g": 10, "svdd_loss_weight": 0.1, "svdd_score_weight": 0.3,
+                    "vocab_size": 1536},
 }
 
-TOKEN_MODELS = {"gru"}
-DEFAULT_AGGREGATION = {"gru": "mean"}
+TOKEN_MODELS = {"gru", "fusion_svdd"}
+DEFAULT_AGGREGATION = {"gru": "mean", "fusion_svdd": "mean"}
 
 
 def write_json(path, payload):

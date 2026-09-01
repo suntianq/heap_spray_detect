@@ -39,6 +39,7 @@ from models import (IsolationForestDetector, LOFDetector, OCSVMDetector,  # noqa
                     PCADetector, StatisticalThresholdDetector, TorchAEWrapper)
 from models.gru_detector import GRUDetector  # noqa: E402
 from models.fusion import FusionDetector  # noqa: E402
+from models.fusion_svdd import FusionSVDDDetector  # noqa: E402
 from scripts.train import common  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -63,6 +64,9 @@ MODEL_FACTORY = {
         gru_config={"epochs": 20, "batch_size": 256, "g": 10},
         ocsvm_config={"kernel": "rbf", "nu": 0.05, "gamma": "scale"},
         w_gru=0.6, w_ocsvm=0.4),
+    "fusion_svdd": lambda seed: FusionSVDDDetector(
+        seed=seed, epochs=20, batch_size=256, g=10,
+        svdd_loss_weight=0.1, svdd_score_weight=0.3),
 }
 
 MODEL_CONFIG = {
@@ -78,16 +82,19 @@ MODEL_CONFIG = {
     "gru": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3, "g": 10,
             "vocab_size": 1536},
     "fusion": {"w_gru": 0.6, "w_ocsvm": 0.4, "gru_epochs": 20, "ocsvm_kernel": "rbf"},
+    "fusion_svdd": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3,
+                    "g": 10, "svdd_loss_weight": 0.1, "svdd_score_weight": 0.3,
+                    "vocab_size": 1536},
 }
 
 # Models that use token sequences (N, L) int32 instead of feature sequences (N, T, F) float32.
-TOKEN_MODELS = {"gru"}
+TOKEN_MODELS = {"gru", "fusion_svdd"}
 # Models that need BOTH token sequences and window features.
 FUSION_MODELS = {"fusion"}
 
-# Default aggregation per model family: GRU uses mean (violation rate),
+# Default aggregation per model family: GRU/FusionSVDD uses mean (violation rate),
 # feature models use max (any-window anomaly).
-DEFAULT_AGGREGATION = {"gru": "mean", "fusion": "mean"}
+DEFAULT_AGGREGATION = {"gru": "mean", "fusion_svdd": "mean", "fusion": "mean"}
 
 
 def make_experiment_dir(out_root, experiment_id):
