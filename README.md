@@ -29,7 +29,7 @@ QEMU guest 采集 (ftrace kmalloc/kfree + trace_marker)
    → csv2features(CSV → 90 维窗口特征, 100ms 窗口 / 50ms 步长 / 32 步序列)
    → build_pilot_dataset + pilot_gates (G1–G6+G9 数据门禁)
    → run_experiment 训练评估
-   → final_v2_report → ACCEPTANCE_M6.md
+   → compare_models 结果对比 CSV
 ```
 
 ## 目录结构
@@ -56,14 +56,14 @@ heap_spray/
 │   │   ├── pilot_gates.py             # G1–G6+G9 数据门禁
 │   │   ├── migrate_datasets.py        # 旧 final-v2 布局 → CVE-first 布局
 │   │   ├── cross_cve_aggregate.py     # 跨 CVE 实验汇总表
-│   │   └── final_v2_report.py         # 验收报告
+│   │   └── compare_models.py          # 多模型结果对比 CSV
 │   ├── train/                         # run_experiment.py + run_cve_split.py + common.py
 │   └── visualize/                     # score_scatter.py / demo_figure.py
 ├── datasets/
 │   ├── raw/<CVE>/{attack,normal,baseline}/<variant|workload>/run_XXX_*/   # 原始 trace + manifest
 │   ├── processed/{attack,normal}/     # features.npz（90 维特征 + 序列）
 │   └── dataset_manifest.json          # run 注册表
-├── runs/                              # 实验输出 + ACCEPTANCE_M6.md
+├── runs/                              # 实验输出
 └── KHeaps/                            # KHeaps 漏洞复现框架（MIT，guest 镜像 + PoC 源码）
 ```
 
@@ -204,11 +204,11 @@ python scripts/train/run_cve_split.py --model ocsvm \
     --dataset-manifest $DATA/dataset_manifest.json --out runs --name cveAB_testC
 ```
 
-### 报告
+### 结果对比
 
 ```bash
-python scripts/validate/final_v2_report.py --runs runs --dataset datasets \
-    --out runs/ACCEPTANCE_M6.md
+python scripts/validate/compare_models.py --runs runs --out results/model_comparison.csv
+# 可选: --model-filter ocsvm gru fusion
 ```
 
 ## 可视化

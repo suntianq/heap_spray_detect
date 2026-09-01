@@ -17,7 +17,7 @@
 #   2. attack collection  : CVEs x {single_spray, combo} + no-spray baseline
 #   3. build + data gates : trace2csv -> csv2features -> pilot_gates (G1-G6)
 #   4. train/eval         : 4 models (base)
-#   5. final report       : compile runs/ACCEPTANCE_M6.md from the runs
+#   5. compare models     : generate results CSV from all runs
 #
 # Fail-closed: collection only ever boots its own QEMU (start_new_session=True)
 # and stop_qemu kills only that process group. The orphan CVE-2016-0728 QEMU
@@ -138,11 +138,5 @@ run_train() { # <name> <model>
 for MODEL in $MODELS; do
   run_train "train_${MODEL}_base" "$MODEL"
 done
-
-# --------------------------------------------------------------- report ----
-run_phase final_report bash -c "
-$PY scripts/validate/final_v2_report.py --runs $ROOT/runs \
-    --dataset $DATA --out $ROOT/runs/ACCEPTANCE_M6.md
-"
 
 echo "[m6] ALL PHASES DONE at $(date -Is)"

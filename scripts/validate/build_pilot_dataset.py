@@ -58,8 +58,8 @@ def run(cmd, **kwargs):
     result = subprocess.run([str(c) for c in cmd], cwd=ROOT, capture_output=True,
                             text=True, **kwargs)
     # Relay the step's output on success too: the build log is a deliverable
-    # (final_v2_report parses the gate lines from it), and swallowing stdout on
-    # success hid every [PASS]/[FAIL] line once gates started passing.
+    # and swallowing stdout on success hid every [PASS]/[FAIL] line once gates
+    # started passing.
     if result.stdout:
         print(result.stdout.rstrip())
     if result.stderr:

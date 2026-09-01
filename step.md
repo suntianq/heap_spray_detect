@@ -114,11 +114,11 @@ python3 scripts/train/run_cve_split.py --model fusion \
     --dataset-manifest $DATA/dataset_manifest.json --out runs --name cveAB_testC
 ```
 
-### 3.3 验收报告
+### 3.3 结果对比
 
 ```bash
-python3 scripts/validate/final_v2_report.py --runs runs --dataset datasets \
-    --out runs/ACCEPTANCE_M6.md
+python3 scripts/validate/compare_models.py --runs runs --out results/model_comparison.csv
+# 可选: --model-filter ocsvm gru fusion
 ```
 
 ---
