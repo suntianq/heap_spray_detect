@@ -347,18 +347,31 @@ def _collect_stats_worker(trace_path):
 
 
 def _tokenize_run_worker(task):
-    """Parse + tokenize one run. Returns (cls, seqs, seq_labels, seq_ids) or None."""
-    run_id, cls, trace_path, spray_window, seq_len, stride = task
-    events, _ = parse_trace_log(trace_path)
+    """Parse + tokenize one run. Returns dict with seqs/labels/ids or None.
+
+    spray_window is resolved inside the worker (from manifest or trace markers)
+    to avoid a sequential parsing bottleneck in the main process.
+    """
+    run_id, cls, trace_path, spray_window, run_dir, seq_len, stride = task
+    events, markers = parse_trace_log(trace_path)
     if not events:
         return None
-    spray_start = spray_window.get("SPRAY_START")
-    spray_end = spray_window.get("SPRAY_END")
+    # If manifest didn't provide a spray window, use markers from the trace
+    if not spray_window and markers:
+        spray_window = markers
+    spray_start = spray_window.get("SPRAY_START") if spray_window else None
+    spray_end = spray_window.get("SPRAY_END") if spray_window else None
+
     tokens, event_labels = tokenize_run(events, _worker_profiles, spray_start, spray_end)
     seqs, seq_labels, seq_ids = cut_sequences(tokens, event_labels, run_id, seq_len, stride)
-    if not seqs:
-        return None
-    return cls, seqs, seq_labels, seq_ids
+
+    return {
+        "cls": cls,
+        "seqs": seqs,
+        "seq_labels": seq_labels,
+        "seq_ids": seq_ids,
+        "has_seqs": len(seqs) > 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -425,15 +438,16 @@ def main():
              freq_thresholds["p95"])
 
     # ---- 3. Tokenize + cut sequences for each run (parallel) ----
-    # Prepare tasks: each worker parses + tokenizes one run
+    # Prepare tasks: each worker parses + tokenizes one run.
+    # spray_window extraction is done inside the worker (not here) to avoid
+    # a sequential bottleneck of parsing 500+ normal trace.log files.
     tasks = []
     for run_id, cls, trace_path, run_dir in runs:
         spray_window = manifest_spray_window(run_dir)
-        if not spray_window:
-            # Fallback: parse markers from trace.log (will be parsed again in worker)
-            _, markers = parse_trace_log(trace_path)
-            spray_window = markers
-        tasks.append((run_id, cls, trace_path, spray_window, args.seq_len, args.stride))
+        # If no manifest window, pass run_dir so the worker can extract markers
+        # from the trace.log itself (parallelized, not sequential here).
+        tasks.append((run_id, cls, trace_path, spray_window, run_dir,
+                      args.seq_len, args.stride))
 
     if workers > 1 and len(tasks) > 1:
         log.info("Tokenizing %d runs with %d workers", len(tasks), workers)
@@ -447,9 +461,12 @@ def main():
     attack_seqs, attack_labels, attack_ids = [], [], []
     normal_seqs, normal_labels, normal_ids = [], [], []
     for result in results:
-        if result is None:
+        if result is None or not result["has_seqs"]:
             continue
-        cls, seqs, seq_lbls, seq_rids = result
+        cls = result["cls"]
+        seqs = result["seqs"]
+        seq_lbls = result["seq_labels"]
+        seq_rids = result["seq_ids"]
         if cls == "attack":
             attack_seqs.extend(seqs)
             attack_labels.extend(seq_lbls)
