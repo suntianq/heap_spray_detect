@@ -336,16 +336,23 @@ def main():
     test_scores = common.score_sequences(model, test_sequences, args.aggregation)
     test_labels = np.zeros(len(test_scores), dtype=np.int8)
 
-    attack_keep = attack_seq_labels >= 0  # drop boundary sequences
+    # Score ALL attack sequences: boundary sequences (label -1, partial spray
+    # overlap) may contain spray events and often score high, so they must
+    # count toward the run-level max. They stay excluded from sequence-level
+    # metrics (ambiguous label), and from grouped/held-out breakdowns.
     if is_token_model:
-        attack_sequences = attack_seqs[attack_keep].astype(np.int32)
+        attack_sequences_all = attack_seqs.astype(np.int32)
     else:
-        attack_sequences = attack_seqs[attack_keep].astype(np.float32)
-    attack_scores = common.score_sequences(model, attack_sequences, args.aggregation)
+        attack_sequences_all = attack_seqs.astype(np.float32)
+    attack_scores_all = common.score_sequences(model, attack_sequences_all, args.aggregation)
+    del attack_sequences_all
+
+    attack_keep = attack_seq_labels >= 0  # subset for sequence-level metrics
+    attack_scores = attack_scores_all[attack_keep]
     attack_labels = attack_seq_labels[attack_keep]
     attack_groups_all = attack_seq_run_ids[attack_keep]
     score_seconds = time.perf_counter() - _t_score
-    scored_sequences = len(test_scores) + len(attack_scores)
+    scored_sequences = len(test_scores) + len(attack_scores_all)
 
     if args.held_out_cve:
         held_mask = np.array([g.startswith(args.held_out_cve + "/") for g in attack_groups_all])
@@ -357,15 +364,29 @@ def main():
         held_scores = attack_scores[held_mask]
         held_labels = attack_labels[held_mask]
         held_groups = np.char.add("attack:", attack_groups_all[held_mask])
+        # Run pool mirrors the dev subset (held-out CVE stays out of aggregate)
+        held_mask_full = np.array([g.startswith(args.held_out_cve + "/")
+                                   for g in attack_seq_run_ids])
+        run_pool_scores = np.concatenate((test_scores, attack_scores_all[~held_mask_full]))
+        run_pool_groups = np.concatenate((
+            np.char.add("normal:", test_groups_arr),
+            np.char.add("attack:", attack_seq_run_ids[~held_mask_full])))
+        run_pool_labels = np.concatenate((test_labels, attack_seq_labels[~held_mask_full]))
     else:
         all_scores = np.concatenate((test_scores, attack_scores))
         all_labels = np.concatenate((test_labels, attack_labels))
         all_groups = np.concatenate((np.char.add("normal:", test_groups_arr),
                                      np.char.add("attack:", attack_groups_all)))
         held_scores, held_labels, held_groups = None, None, None
+        # Run pool includes ALL attack sequences (boundary included): run-level
+        # max must see every sequence score of the run.
+        run_pool_scores = np.concatenate((test_scores, attack_scores_all))
+        run_pool_groups = np.concatenate((np.char.add("normal:", test_groups_arr),
+                                          np.char.add("attack:", attack_seq_run_ids)))
+        run_pool_labels = np.concatenate((test_labels, attack_seq_labels))
 
     seq_metrics = common.classification_metrics(all_scores, all_labels, threshold)
-    run_scores, run_ids = common.run_max_scores(all_scores, all_groups)
+    run_scores, run_ids = common.run_max_scores(run_pool_scores, run_pool_groups)
     # Run-level label from run identity (data-source class), NOT derived from
     # sequence labels: an attack run stays attack even when none of its
     # sequences carries label 1 (spray window diluted below sequence
@@ -381,7 +402,8 @@ def main():
 
     # Diagnostics: attack runs whose sequences are all label<=0 ("ghost" runs
     # the old sequence-derived labels miscounted as normal at run level).
-    run_seq_label_max = {str(g): int(all_labels[all_groups == g].max())
+    # Computed on the run pool (all sequences incl. boundary).
+    run_seq_label_max = {str(g): int(run_pool_labels[run_pool_groups == g].max())
                          for g in run_ids}
     attack_run_ids = [str(g) for g in run_ids if str(g).startswith("attack:")]
     attack_runs_no_spray = sum(1 for g in attack_run_ids
