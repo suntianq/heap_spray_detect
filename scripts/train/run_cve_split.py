@@ -37,10 +37,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import config  # noqa: E402
-from models import (IsolationForestDetector, LOFDetector, OCSVMDetector,  # noqa: E402
-                    PCADetector, StatisticalThresholdDetector, TorchAEWrapper)
+from models import OCSVMDetector, TorchAEWrapper  # noqa: E402
 from models.gru_detector import GRUDetector  # noqa: E402
-from models.fusion import FusionDetector  # noqa: E402
 from models.fusion_svdd import FusionSVDDDetector  # noqa: E402
 from scripts.train import common  # noqa: E402
 
@@ -48,14 +46,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("run_cve_split")
 
 MODEL_FACTORY = {
-    "stat_threshold": lambda seed: StatisticalThresholdDetector(n_sigma=3.0),
-    "pca": lambda seed: PCADetector(n_components=0.95),
-    "isolation_forest": lambda seed: IsolationForestDetector(
-        contamination=0.01, n_estimators=200, random_state=seed),
     "ocsvm": lambda seed: OCSVMDetector(kernel="rbf", nu=0.05, gamma="scale"),
-    "lof": lambda seed: LOFDetector(n_neighbors=20, contamination=0.01),
-    "mlp_ae": lambda seed: TorchAEWrapper("mlp_ae", seed=seed,
-                                          epochs=30, batch_size=128),
     "lstm_ae": lambda seed: TorchAEWrapper("lstm_ae", seed=seed,
                                            epochs=25, seq_batch_size=64),
     "lstm_vae": lambda seed: TorchAEWrapper("lstm_vae", seed=seed,
@@ -67,12 +58,7 @@ MODEL_FACTORY = {
 }
 
 MODEL_CONFIG = {
-    "stat_threshold": {"n_sigma": 3.0},
-    "pca": {"n_components": 0.95},
-    "isolation_forest": {"contamination": 0.01, "n_estimators": 200},
     "ocsvm": {"kernel": "rbf", "nu": 0.05, "gamma": "scale"},
-    "lof": {"n_neighbors": 20, "contamination": 0.01},
-    "mlp_ae": {"hidden_dims": (128, 64), "latent_dim": 16, "epochs": 30, "lr": 1e-3},
     "lstm_ae": {"hidden_dim": 64, "latent_dim": 16, "num_layers": 2, "epochs": 25, "lr": 1e-3},
     "lstm_vae": {"hidden_dim": 64, "latent_dim": 16, "num_layers": 2, "epochs": 25,
                  "lr": 1e-3, "beta": 1.0},
@@ -308,11 +294,26 @@ def main():
 
     seq_metrics = common.classification_metrics(all_scores, all_labels, threshold)
     run_scores, run_ids = common.run_max_scores(all_scores, all_groups)
-    run_labels = np.asarray([int(all_labels[all_groups == g].max()) for g in run_ids],
-                            dtype=np.int8)
+    # Run-level label from run identity (data-source class), NOT derived from
+    # sequence labels: an attack run stays attack even when none of its
+    # sequences carries label 1 (spray window diluted below sequence
+    # granularity, or dropped by the boundary policy). The collector fixed the
+    # run's class at collection time (PoC executed with spray markers).
+    # Baseline runs are collected under normal/ and are intentional negative
+    # controls (label 0, checked by gate G10).
+    run_labels = np.asarray([1 if str(g).startswith("attack:") else 0
+                             for g in run_ids], dtype=np.int8)
     run_metrics = common.classification_metrics(run_scores, run_labels, run_threshold)
     run_ci = common.bootstrap_run_ci(run_scores, run_labels, run_threshold,
                                      n_boot=2000, seed=args.seed)
+
+    # Diagnostics: attack runs whose sequences are all label<=0 ("ghost" runs
+    # the old sequence-derived labels miscounted as normal at run level).
+    run_seq_label_max = {str(g): int(all_labels[all_groups == g].max())
+                         for g in run_ids}
+    attack_run_ids = [str(g) for g in run_ids if str(g).startswith("attack:")]
+    attack_runs_no_spray = sum(1 for g in attack_run_ids
+                               if run_seq_label_max[g] < 1)
 
     # grouped by cve (attack side) + by variant
     attack_idx = np.asarray([g.startswith("attack:") for g in all_groups])
@@ -340,6 +341,8 @@ def main():
             "attack_sequences_evaluated": int(len(attack_scores)),
             "attack_spray_sequences": int(np.sum(attack_labels == 1)),
             "attack_normal_context_sequences": int(np.sum(attack_labels == 0)),
+            "attack_runs_total": len(attack_run_ids),
+            "attack_runs_no_spray_sequence": attack_runs_no_spray,
         },
         "inference": {
             "score_seconds": round(score_seconds, 4),

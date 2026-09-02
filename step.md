@@ -89,8 +89,8 @@ python3 scripts/train/run_experiment.py --model gru \
     --attack-data $PROC_A --normal-data $PROC_N \
     --dataset-manifest $DATA/dataset_manifest.json --out runs
 
-# 双轴融合模型（GRU + ocsvm）
-python3 scripts/train/run_experiment.py --model fusion \
+# 统一 GRU + Deep SVDD 双头（全 GPU，仅 token 序列）
+python3 scripts/train/run_experiment.py --model fusion_svdd \
     --attack-data $PROC_A --normal-data $PROC_N \
     --dataset-manifest $DATA/dataset_manifest.json --out runs
 ```
@@ -132,11 +132,10 @@ python3 scripts/validate/compare_models.py --runs runs --out results/model_compa
 
 | 模型 | 类型 | 输入 | 评分方式 | 说明 |
 |------|------|------|---------|------|
-| ocsvm | 窗口特征 | features.npz (101维) | -score_samples | 主检测器，量轴 |
-| mlp_ae | 窗口特征 | features.npz (101维) | 重建误差 | 高吞吐替代 |
-| lstm_ae | 序列特征 | features.npz (32×101) | 重建误差 | 序列级 |
-| gru | 事件 token | token_sequences.npz (128) | top-g 违例率 | 结构轴，主力 |
-| fusion | 双轴 | features + tokens | 分位数融合 | GRU + ocsvm |
+| ocsvm | 窗口特征 | features.npz (101维) | -score_samples | 基线（ThunderSVM GPU 自动适配） |
+| lstm_ae | 序列特征 | features.npz (32×101) | 重建误差 | 序列级基线 |
+| gru | 事件 token | token_sequences.npz (128) | top-g 违例率 | 结构轴 |
+| fusion_svdd | 统一双头 | token_sequences.npz (128) | 违例率 + SVDD 距离 | 主力，全 GPU |
 
 ### schema v3 新增特征（11 维）
 

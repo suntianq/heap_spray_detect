@@ -44,15 +44,13 @@ mkdir -p "$LOG_DIR" "$MARK_DIR"
 
 CVES="CVE-2017-11176 CVE-2017-7308"
 NORMAL_WORKLOADS="idle msg_msg keyctl net_busy fs_io fork_stress mem_pressure"
-# M6 model set (user decision, revised 2026-08-31): svm (ocsvm), lstm-ae,
-# baselines mlp_ae and lstm_vae. ngram was removed (worst cross-CVE AUC 0.807).
-# NO leave-one-CVE-out this round -- the final report is a straight N-model base
-# comparison. TOLERANT models are ones whose G10 is known-unstable or unknown: a
-# completed run whose only problem is a FAILed gate is a valid finding and must
-# not halt the pipeline (a real crash -- no "SOME M5 GATES FAILED" in the log --
-# still halts).
-MODELS="ocsvm lstm_ae mlp_ae lstm_vae"
-TOLERANT_MODELS="lstm_ae mlp_ae lstm_vae"
+# M6 model set: svm (ocsvm), gru, fusion_svdd, baselines lstm_ae and lstm_vae.
+# ngram / mlp_ae / fusion(GRU+OCSVM) removed. TOLERANT models are ones whose
+# G10 is known-unstable or unknown: a completed run whose only problem is a
+# FAILed gate is a valid finding and must not halt the pipeline (a real crash
+# -- no "SOME M5 GATES FAILED" in the log -- still halts).
+MODELS="ocsvm lstm_ae lstm_vae gru fusion_svdd"
+TOLERANT_MODELS="lstm_ae lstm_vae"
 
 # Run a phase once; record a marker so re-launch resumes rather than redoes.
 run_phase() {

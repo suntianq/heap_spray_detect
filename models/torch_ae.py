@@ -1,14 +1,12 @@
-"""M5 adapter: train/score the torch autoencoders through the window/sequence API.
+"""M5 adapter: train/score the torch autoencoders through the sequence API.
 
-The raw nn.Modules (MLPAE / LSTMAE / LSTMVAE) expose forward + loss_function but no
+The raw nn.Modules (LSTMAE / LSTMVAE) expose forward + loss_function but no
 fit loop, and their anomaly_score consumes torch tensors rather than the numpy
-window/sequence matrices the harness feeds. TorchAEWrapper adds the missing glue
+sequence matrices the harness feeds. TorchAEWrapper adds the missing glue
 without changing the models:
 
-  * fit(windows)            -- window-level training (mlp_ae); scores per window (N,)
-  * fit_sequences(sequences) -- sequence-level training (lstm_ae / lstm_vae)
-  * anomaly_score(windows)            -- (N, F) numpy -> per-window scores (N,)
-  * sequence_anomaly_score(sequences) -- (N, T, F) numpy -> per-window-in-seq (N, T)
+  * fit_sequences(sequences)           -- sequence-level training
+  * sequence_anomaly_score(sequences)  -- (N, T, F) numpy -> per-window-in-seq (N, T)
     so common.score_sequences can dispatch without the harness knowing the family.
 
 Leak-safety: normalization statistics (mean, std) are computed from the training
@@ -18,38 +16,35 @@ or test data. Scoring normalizes with those frozen statistics.
 Device: the wrapper auto-detects the compute device at network construction
 (torch.device("cuda" if torch.cuda.is_available() else "cpu")) and moves both
 parameters and batches there, so deep models use the GPU when present. Classical
-sklearn models (ocsvm, isolation_forest, ...) never enter this path and stay on
-CPU by design. On CPU, execution stays single-threaded so a fixed seed
-reproduces the fit; CUDA training is not bit-reproducible across runs.
+sklearn models (ocsvm) never enter this path and stay on CPU by design. On CPU,
+execution stays single-threaded so a fixed seed reproduces the fit; CUDA
+training is not bit-reproducible across runs.
 """
 
 import numpy as np
 
 from .lstm_ae import LSTMAE
 from .lstm_vae import LSTMVAE
-from .mlp_ae import MLPAE
 
 __all__ = ["TorchAEWrapper"]
 
 
 class TorchAEWrapper:
-    def __init__(self, model_kind, seed=42, latent_dim=16, hidden_dims=(128, 64),
-                 hidden_dim=64, num_layers=2, epochs=30, lr=1e-3, batch_size=128,
-                 beta=1.0, seq_batch_size=64):
-        if model_kind not in ("mlp_ae", "lstm_ae", "lstm_vae"):
+    def __init__(self, model_kind, seed=42, latent_dim=16,
+                 hidden_dim=64, num_layers=2, epochs=30, lr=1e-3,
+                 beta=1.0, seq_batch_size=64, **_ignored):
+        if model_kind not in ("lstm_ae", "lstm_vae"):
             raise ValueError(f"unknown torch model kind: {model_kind}")
         self.model_kind = model_kind
         self.seed = seed
-        # dispatch marker for the harness: sequence models train on sequences via
-        # fit_sequences; window models (mlp_ae) train on windows via fit().
-        self.sequence_model = model_kind in ("lstm_ae", "lstm_vae")
+        # dispatch marker for the harness: sequence models train on sequences
+        # via fit_sequences and score via sequence_anomaly_score.
+        self.sequence_model = True
         self.latent_dim = latent_dim
-        self.hidden_dims = tuple(hidden_dims)
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.epochs = epochs
         self.lr = lr
-        self.batch_size = batch_size
         self.beta = beta
         self.seq_batch_size = seq_batch_size
         self.net = None
@@ -58,14 +53,6 @@ class TorchAEWrapper:
         self.device = None
 
     # ---- training ----------------------------------------------------------
-
-    def fit(self, windows):
-        """Window-level fit (mlp_ae): scaler + net statistics from train windows."""
-        self._set_stats(windows)
-        feat_dim = int(windows.shape[1])
-        self.net = self._make_net(feat_dim)
-        self._train(windows, self.batch_size)
-        return self
 
     def fit_sequences(self, sequences):
         """Sequence-level fit (lstm_ae / lstm_vae)."""
@@ -77,15 +64,6 @@ class TorchAEWrapper:
         return self
 
     # ---- scoring -----------------------------------------------------------
-
-    def anomaly_score(self, windows):
-        """(N, F) numpy -> per-window anomaly scores (N,)."""
-        if self.model_kind != "mlp_ae":
-            raise TypeError("anomaly_score(windows) is only for window-level models")
-        import torch
-        x = self._tensor(windows)
-        with torch.no_grad():
-            return self.net.anomaly_score(x).cpu().numpy().reshape(-1)
 
     def sequence_anomaly_score(self, sequences):
         """(N, T, F) numpy -> per-window-in-sequence errors (N, T)."""
@@ -133,10 +111,7 @@ class TorchAEWrapper:
         if device.type == "cpu":
             # Keep the CPU path single-threaded so a fixed seed reproduces the fit.
             torch.set_num_threads(1)
-        if self.model_kind == "mlp_ae":
-            net = MLPAE(feat_dim, hidden_dims=list(self.hidden_dims),
-                        latent_dim=self.latent_dim)
-        elif self.model_kind == "lstm_ae":
+        if self.model_kind == "lstm_ae":
             net = LSTMAE(feat_dim, self.hidden_dim, self.latent_dim, seq_len,
                          num_layers=self.num_layers)
         else:

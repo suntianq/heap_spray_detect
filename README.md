@@ -39,9 +39,11 @@ heap_spray/
 ├── config.py                          # 全局配置（路径、CVE 列表、特征/超参）
 ├── requirements.txt                   # 真机依赖清单（仅 numpy）
 ├── models/                            # 检测模型（torch AE 包装 + sklearn）
-│   ├── torch_ae.py                    # TorchAEWrapper：window/sequence 训练打分胶水
-│   ├── mlp_ae.py / lstm_ae.py / lstm_vae.py   # 深度学习自编码器（nn.Module）
-│   └── ocsvm.py / isolation_forest.py / lof_detector.py / pca_detector.py / stat_threshold.py
+│   ├── torch_ae.py                    # TorchAEWrapper：sequence 训练打分胶水
+│   ├── gru_detector.py                # 事件级 GRU + top-g 违例评分
+│   ├── fusion_svdd.py                 # 统一 GRU + Deep SVDD 双头
+│   ├── lstm_ae.py / lstm_vae.py       # 深度学习自编码器（nn.Module）
+│   └── ocsvm.py                       # One-Class SVM（ThunderSVM GPU 自动适配）
 ├── scripts/
 │   ├── collect/                       # QEMU 采集
 │   │   ├── collect_stable.py          # normal 采集（8 类负载）
@@ -166,10 +168,11 @@ csv2features → pilot_gates（G1–G6+G9）。产出 `processed/{attack,normal}
 
 | 模型 | 类型 | 评分单元 |
 |------|------|---------|
-| **ocsvm**（主检测） | One-Class SVM | 窗口/序列级 |
-| **mlp_ae**（高吞吐替代） | MLP 自编码器 | 窗口级 |
+| **ocsvm**（基线） | One-Class SVM | 窗口级 |
 | lstm_ae | LSTM 自编码器 | 序列级 |
 | lstm_vae | LSTM 变分自编码器（β 退火 + free bits） | 序列级 |
+| **gru** | 事件级 GRU（next-token + top-g 违例） | 事件级 |
+| **fusion_svdd**（主力） | 统一 GRU + Deep SVDD 双头 | 事件级 |
 
 深度学习模型自动使用 GPU（`torch.device` 自动检测）；sklearn 模型留 CPU。CPU 路径保持
 单线程、固定 seed 可复现；CUDA 训练不逐位可复现。
@@ -182,8 +185,8 @@ PROC_A=$DATA/processed/attack; PROC_N=$DATA/processed/normal
 
 python scripts/train/run_experiment.py --model ocsvm --attack-data $PROC_A \
     --normal-data $PROC_N --dataset-manifest $DATA/dataset_manifest.json --out runs
-python scripts/train/run_experiment.py --model mlp_ae  ...
-python scripts/train/run_experiment.py --model lstm_ae ...
+python scripts/train/run_experiment.py --model gru ...
+python scripts/train/run_experiment.py --model fusion_svdd ...
 ```
 
 每个模型产出 `runs/<时间戳>_<模型>_s<seed>_<序号>/`（model.pkl、evaluation_report.json、
