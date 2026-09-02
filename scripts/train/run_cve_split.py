@@ -247,11 +247,9 @@ def main():
     val_groups_arr = normal_groups_all[val_seq_mask]
     val_seq_scores = common.score_sequences_batched(model, val_sequences, args.aggregation)
     del val_sequences
-    threshold = common.threshold_at_fpr(val_seq_scores, args.target_fpr)
     val_run_scores, _ = common.run_max_scores(val_seq_scores, val_groups_arr)
     run_threshold = common.threshold_at_fpr(val_run_scores, args.target_fpr)
-    log.info("threshold(p%g normal val)=%.6f  run_threshold=%.6f",
-             100 * (1 - args.target_fpr), threshold, run_threshold)
+    log.info("run_threshold(p%g normal val)=%.6f", 100 * (1 - args.target_fpr), run_threshold)
 
     write_json(experiment_dir / "train_report.json", {
         "schema_version": 2,
@@ -260,8 +258,7 @@ def main():
         "train_cves": train_cves,
         "test_cves": test_cves,
         "score_aggregation": args.aggregation,
-        "threshold_policy": f"validation-normal FPR={args.target_fpr}",
-        "threshold": threshold,
+        "threshold_policy": "validation-normal run-level FPR=%s" % args.target_fpr,
         "run_threshold": run_threshold,
         "val_normal_sequences": int(len(val_seq_scores)),
         "seed": args.seed,
@@ -276,8 +273,8 @@ def main():
 
     # Score ALL sequences of test-cve attack runs: boundary sequences
     # (label -1, partial spray overlap) may contain spray events and often
-    # score high, so they must count toward the run-level max. They stay
-    # excluded from sequence-level metrics (ambiguous label).
+    # score high, so they must count toward the run-level max. Evaluation is
+    # run-level only; sequence scores are an intermediate aggregation.
     test_attack_mask_all = np.array([cve_of(g) in test_cves
                                      for g in attack_seq_run_ids])
     if is_token_model:
@@ -287,21 +284,8 @@ def main():
     attack_scores_all = common.score_sequences_batched(
         model, attack_sequences_all, args.aggregation)
     del attack_sequences_all
-
-    attack_keep = attack_seq_labels >= 0  # subset for sequence-level metrics
-    keep_in_test = attack_keep[test_attack_mask_all]
-    attack_scores = attack_scores_all[keep_in_test]
-    attack_labels = attack_seq_labels[test_attack_mask_all][keep_in_test]
-    attack_groups = attack_seq_run_ids[test_attack_mask_all][keep_in_test]
     score_seconds = time.perf_counter() - _t
 
-    # Sequence-level pool (boundary excluded)
-    all_scores = np.concatenate((test_scores, attack_scores))
-    all_labels = np.concatenate((test_labels, attack_labels))
-    all_groups = np.concatenate((np.char.add("normal:", test_groups_arr),
-                                 np.char.add("attack:", attack_groups)))
-
-    seq_metrics = common.classification_metrics(all_scores, all_labels, threshold)
     # Run pool includes ALL test-cve attack sequences (boundary included)
     run_pool_scores = np.concatenate((test_scores, attack_scores_all))
     run_pool_groups = np.concatenate((
@@ -332,14 +316,15 @@ def main():
     attack_runs_no_spray = sum(1 for g in attack_run_ids
                                if run_seq_label_max[g] < 1)
 
-    # grouped by cve (attack side) + by variant
-    attack_idx = np.asarray([g.startswith("attack:") for g in all_groups])
-    attack_cves = np.asarray([cve_of(g) for g in all_groups[attack_idx]])
-    by_cve = common.grouped_metrics(all_scores[attack_idx], all_labels[attack_idx],
-                                    attack_cves, threshold)
+    # grouped at RUN level: flagged-run counts per attack CVE / variant
+    run_attack_idx = np.asarray([str(g).startswith("attack:") for g in run_ids])
+    attack_cves = np.asarray([cve_of(g) for g in np.asarray(run_ids)[run_attack_idx]])
+    by_cve = common.grouped_metrics(run_scores[run_attack_idx], run_labels[run_attack_idx],
+                                    attack_cves, run_threshold)
     by_variant = common.grouped_metrics(
-        all_scores[attack_idx], all_labels[attack_idx],
-        np.asarray([str(g).split(":", 1)[1] for g in all_groups[attack_idx]]), threshold)
+        run_scores[run_attack_idx], run_labels[run_attack_idx],
+        np.asarray([str(g).split(":", 1)[1] for g in np.asarray(run_ids)[run_attack_idx]]),
+        run_threshold)
 
     evaluation_report = {
         "schema_version": 2,
@@ -348,32 +333,33 @@ def main():
         "train_cves": train_cves,
         "test_cves": test_cves,
         "score_aggregation": args.aggregation,
-        "sequence_level": seq_metrics,
         "run_level": run_metrics,
         "run_bootstrap_ci95": run_ci,
         "grouped": {"by_cve": by_cve, "by_variant": by_variant},
         "counts": {
             "test_normal_sequences": int(len(test_scores)),
             "test_normal_runs": int(len(set(test_groups_arr.tolist()))),
-            "attack_sequences_evaluated": int(len(attack_scores)),
-            "attack_spray_sequences": int(np.sum(attack_labels == 1)),
-            "attack_normal_context_sequences": int(np.sum(attack_labels == 0)),
+            "attack_sequences_evaluated": int(len(attack_scores_all)),
+            "attack_spray_sequences": int(np.sum(attack_seq_labels[test_attack_mask_all] == 1)),
+            "attack_normal_context_sequences": int(np.sum(attack_seq_labels[test_attack_mask_all] == 0)),
             "attack_runs_total": len(attack_run_ids),
             "attack_runs_no_spray_sequence": attack_runs_no_spray,
         },
         "inference": {
             "score_seconds": round(score_seconds, 4),
-            "sequences_per_second": round(float(len(all_scores)) / max(score_seconds, 1e-9), 1),
-            "windows_per_second": round(float(len(all_scores) * seq_len) / max(score_seconds, 1e-9), 1),
+            "sequences_per_second": round(float(len(run_pool_scores)) / max(score_seconds, 1e-9), 1),
+            "windows_per_second": round(float(len(run_pool_scores) * seq_len) / max(score_seconds, 1e-9), 1),
         },
     }
     write_json(experiment_dir / "evaluation_report.json", evaluation_report)
 
     # ---- gates G8 / G10 ------------------------------------------------------
-    g8_ok = bool(seq_metrics.get("roc_auc") is not None)
+    g8_ok = bool(run_metrics.get("roc_auc") is not None)
     gates.append({"name": "G8_train_evaluate_end_to_end", "ok": g8_ok,
                   "detail": f"model={args.model} trained and evaluated; "
-                            f"test normal={len(test_scores)} / attack spray={int(np.sum(attack_labels == 1))}"})
+                            f"test normal={len(run_ids) - len(attack_run_ids)} runs / "
+                            f"attack={len(attack_run_ids)} runs "
+                            f"({int(np.sum(attack_seq_labels[test_attack_mask_all] == 1))} spray sequences)"})
     baseline_flags = np.asarray(run_scores)[
         np.asarray(["/poc_cfh_baseline/" in g for g in run_ids])] > run_threshold
     n_base = int(len(baseline_flags))
@@ -391,9 +377,8 @@ def main():
     row = {"experiment_id": experiment, "model": args.model, "seed": args.seed,
            "train_cves": ",".join(train_cves), "test_cves": ",".join(test_cves),
            "target_fpr": args.target_fpr, "aggregation": args.aggregation}
-    for level, m in (("seq", seq_metrics), ("run", run_metrics)):
-        for key in ("roc_auc", "pr_auc", "f1_at_threshold", "fpr_at_threshold"):
-            row[f"{level}_{key}"] = m.get(key, "")
+    for key in ("roc_auc", "pr_auc", "f1_at_threshold", "fpr_at_threshold"):
+        row[f"run_{key}"] = run_metrics.get(key, "")
     with open(experiment_dir / "metrics.csv", "w", newline="") as handle:
         w = csv.DictWriter(handle, fieldnames=sorted(row))
         w.writeheader()
@@ -403,10 +388,11 @@ def main():
     if src.exists():
         (experiment_dir / "dataset_manifest.json").write_text(src.read_text())
 
-    log.info("=== run AUC=%.4f run F1=%.4f seq AUC=%.4f (train=%s test=%s) ===",
+    log.info("=== run AUC=%.4f run F1=%.4f run P=%.4f run R=%.4f (train=%s test=%s) ===",
              run_metrics.get("roc_auc", float("nan")),
              run_metrics.get("f1_at_threshold", float("nan")),
-             seq_metrics.get("roc_auc", float("nan")),
+             run_metrics.get("precision_at_threshold", float("nan")),
+             run_metrics.get("recall_at_threshold", float("nan")),
              ",".join(train_cves), ",".join(test_cves))
     return 0 if all(g["ok"] for g in gates) else 1
 

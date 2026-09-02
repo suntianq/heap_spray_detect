@@ -160,12 +160,13 @@ class TestM5Pipeline(unittest.TestCase):
             self.assertTrue(gate["ok"], f"gate failed: {gate['name']}: {gate['detail']}")
 
         report = json.loads((exp / "evaluation_report.json").read_text())
-        seq = report["sequence_level"]
-        self.assertTrue(all(k in seq for k in ("roc_auc", "pr_auc", "f1_at_threshold",
-                                                "fpr_at_threshold")))
-        self.assertTrue(np.isfinite(seq["roc_auc"]))
+        self.assertNotIn("sequence_level", report)  # run-level-only evaluation
+        run = report["run_level"]
+        self.assertTrue(all(k in run for k in ("roc_auc", "pr_auc", "f1_at_threshold",
+                                               "fpr_at_threshold")))
+        self.assertTrue(np.isfinite(run["roc_auc"]))
         # the synthetic spray is dense/large enough that the baseline must beat chance
-        self.assertGreater(seq["roc_auc"], 0.5)
+        self.assertGreater(run["roc_auc"], 0.5)
 
     def test_run_split_disjoint(self):
         split = json.loads((self.experiments[0] / "split_manifest.json").read_text())
@@ -177,18 +178,20 @@ class TestM5Pipeline(unittest.TestCase):
         exp = self.experiments[0]
         train = json.loads((exp / "train_report.json").read_text())
         report = json.loads((exp / "evaluation_report.json").read_text())
-        threshold = train["threshold"]
-        # threshold must equal the p(1-fpr) percentile of the calibration scores;
-        # recompute it from the val set through the saved model to prove no test
-        # information entered calibration.
+        run_threshold = train["run_threshold"]
+        # run_threshold must equal the p(1-fpr) percentile of the calibration
+        # scores; recompute it from the val set through the saved model to
+        # prove no test information entered calibration.
         normal = np.load(self.out / "processed" / "normal" / "features.npz",
                          allow_pickle=True)
         split = json.loads((exp / "split_manifest.json").read_text())
         val_groups = set(split["val_groups"])
         val_mask = np.isin(normal["seq_run_ids"].astype(str), list(val_groups))
         val_seq = normal["sequences"][val_mask].astype(np.float32)
+        val_run_ids = normal["seq_run_ids"].astype(str)[val_mask]
         # Unpickle the ocsvm model and replay the harness score path:
-        # anomaly_score per window, "max" aggregation over the sequence.
+        # anomaly_score per window, "max" aggregation over the sequence,
+        # then max over each val run's sequences (run-level scores).
         # (The venv interpreter has torch, so unpickling through the models
         # package is safe.)
         import pickle
@@ -197,16 +200,17 @@ class TestM5Pipeline(unittest.TestCase):
         n, t, f = val_seq.shape
         per_window = np.asarray(model.anomaly_score(val_seq.reshape(n * t, f)),
                                 dtype=np.float64).reshape(n, t)
-        val_scores = per_window.max(axis=1)  # ocsvm, "max" seq aggregation
-        expected = common.threshold_at_fpr(val_scores, common.DEFAULT_TARGET_FPR)
-        self.assertAlmostEqual(threshold, expected, places=4)
+        val_seq_scores = per_window.max(axis=1)  # ocsvm, "max" seq aggregation
+        val_run_scores, _ = common.run_max_scores(val_seq_scores, val_run_ids)
+        expected = common.threshold_at_fpr(val_run_scores, common.DEFAULT_TARGET_FPR)
+        self.assertAlmostEqual(run_threshold, expected, places=4)
         # oracle best-F1 is the max over ALL thresholds, so it must be >= the
         # F1 at the frozen (val-calibrated) threshold. (The old "F1 < 1.0"
         # heuristic assumed imperfect separability; ocsvm separates the
         # synthetic spray perfectly, so F1 can legitimately be 1.0.)
         self.assertGreaterEqual(
-            report["sequence_level"]["oracle_best_f1_test_only"],
-            report["sequence_level"]["f1_at_threshold"] - 1e-9)
+            report["run_level"]["oracle_best_f1_test_only"],
+            report["run_level"]["f1_at_threshold"] - 1e-9)
 
     def test_deterministic(self):
         """Same inputs + config -> identical metrics.csv and evaluation report

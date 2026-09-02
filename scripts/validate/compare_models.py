@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """Compare multiple model experiments in a single CSV table.
 
-Scans runs/*/experiment_config.json + evaluation_report.json, extracts
-core metrics at both sequence and run level, and writes a flat CSV.
+Scans runs/*/experiment_config.json + evaluation_report.json and writes a
+flat CSV with run-level metrics (one row per experiment).
 
-The project has two evaluation levels:
-  - seq level: every 128-token sequence is scored independently. Precision is
-    low because attack runs have hundreds of "background" (non-spray) sequences
-    labeled 0 that can still get high anomaly scores.
-  - run level: each run's score = max over its sequences. This is the real
-    detection unit — "did this run contain a spray attack?". A run is flagged
-    if any one sequence exceeds threshold.
+Evaluation is run-level only: the detection unit is "did this run contain a
+spray attack?". A run's score = max over its sequence scores (boundary
+sequences included); its label comes from the data-source class (attack
+directory = 1), fixed at collection time.
 
 Usage:
     python3 scripts/validate/compare_models.py --runs runs --out results/model_comparison.csv
 
 Optional filters:
-    --model-filter ocsvm gru fusion   only include these models
+    --model-filter ocsvm gru fusion_svdd   only include these models
 """
 import argparse
 import csv
 import json
-import os
 from pathlib import Path
 
 
@@ -70,7 +66,7 @@ def main():
     parser.add_argument("--runs", required=True, help="runs directory")
     parser.add_argument("--out", required=True, help="output CSV path")
     parser.add_argument("--model-filter", nargs="*", default=None,
-                        help="only these model names (e.g. ocsvm gru fusion)")
+                        help="only these model names (e.g. ocsvm gru fusion_svdd)")
     args = parser.parse_args()
 
     experiments = load_experiments(
@@ -83,31 +79,22 @@ def main():
         "model",
         "seed",
         "held_out_cve",
-        # run level (real detection unit)
         "run_auc",
         "run_precision",
         "run_recall",
         "run_f1",
         "run_fpr",
-        # sequence level (per-sequence granularity)
-        "seq_auc",
-        "seq_precision",
-        "seq_recall",
-        "seq_f1",
-        "seq_fpr",
-        # data counts
-        "test_normal_seqs",
-        "attack_spray_seqs",
-        "attack_bg_seqs",
+        "test_normal_runs",
+        "attack_runs_total",
+        "attack_runs_no_spray_sequence",
     ]
 
     rows = []
     for exp in experiments:
         report = exp["report"]
         run = report.get("run_level") or {}
-        seq = report.get("sequence_level") or {}
         counts = report.get("counts") or {}
-        row = {
+        rows.append({
             "model": exp["model"],
             "seed": exp["seed"],
             "held_out_cve": exp["held_out_cve"],
@@ -116,16 +103,10 @@ def main():
             "run_recall": safe(run, "recall_at_threshold"),
             "run_f1": safe(run, "f1_at_threshold"),
             "run_fpr": safe(run, "fpr_at_threshold"),
-            "seq_auc": safe(seq, "roc_auc"),
-            "seq_precision": safe(seq, "precision_at_threshold"),
-            "seq_recall": safe(seq, "recall_at_threshold"),
-            "seq_f1": safe(seq, "f1_at_threshold"),
-            "seq_fpr": safe(seq, "fpr_at_threshold"),
-            "test_normal_seqs": safe(counts, "test_normal_sequences", "{}"),
-            "attack_spray_seqs": safe(counts, "attack_spray_sequences", "{}"),
-            "attack_bg_seqs": safe(counts, "attack_normal_context_sequences", "{}"),
-        }
-        rows.append(row)
+            "test_normal_runs": safe(counts, "test_normal_runs", "{}"),
+            "attack_runs_total": safe(counts, "attack_runs_total", "{}"),
+            "attack_runs_no_spray_sequence": safe(counts, "attack_runs_no_spray_sequence", "{}"),
+        })
 
     rows.sort(key=lambda r: (r["model"], r["held_out_cve"]))
 
@@ -139,12 +120,12 @@ def main():
     print(f"Wrote {out_path} ({len(rows)} experiments)")
     print()
     print(f"{'model':12s} {'run_AUC':>8s} {'run_P':>7s} {'run_R':>7s} {'run_F1':>7s} {'run_FPR':>8s}"
-          f" {'seq_AUC':>8s} {'seq_P':>7s} {'seq_R':>7s} {'seq_F1':>7s}")
-    print("-" * 90)
+          f" {'atk_runs':>8s} {'ghost':>6s}")
+    print("-" * 70)
     for r in rows:
         print(f"{r['model']:12s} {r['run_auc']:>8s} {r['run_precision']:>7s} {r['run_recall']:>7s} "
-              f"{r['run_f1']:>7s} {r['run_fpr']:>8s} {r['seq_auc']:>8s} {r['seq_precision']:>7s} "
-              f"{r['seq_recall']:>7s} {r['seq_f1']:>7s}")
+              f"{r['run_f1']:>7s} {r['run_fpr']:>8s} {r['attack_runs_total']:>8s} "
+              f"{r['attack_runs_no_spray_sequence']:>6s}")
     return 0
 
 

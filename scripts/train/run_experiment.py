@@ -299,11 +299,9 @@ def main():
         val_sequences = normal_seqs[val_seq_mask].astype(np.float32)
     val_groups_arr = normal_groups_all[val_seq_mask]
     val_seq_scores = common.score_sequences(model, val_sequences, args.aggregation)
-    threshold = common.threshold_at_fpr(val_seq_scores, args.target_fpr)
     val_run_scores, val_run_ids = common.run_max_scores(val_seq_scores, val_groups_arr)
     run_threshold = common.threshold_at_fpr(val_run_scores, args.target_fpr)
-    log.info("threshold(p%g normal val)=%.6f  run_threshold=%.6f",
-             100 * (1 - args.target_fpr), threshold, run_threshold)
+    log.info("run_threshold(p%g normal val)=%.6f", 100 * (1 - args.target_fpr), run_threshold)
 
     # ---- 4. train report ----------------------------------------------------
     train_report = {
@@ -314,8 +312,7 @@ def main():
         "feat_dim": feat_dim,
         "seq_len": seq_len,
         "score_aggregation": args.aggregation,
-        "threshold_policy": f"validation-normal FPR={args.target_fpr}",
-        "threshold": threshold,
+        "threshold_policy": "validation-normal run-level FPR=%s" % args.target_fpr,
         "run_threshold": run_threshold,
         "val_normal_sequences": int(len(val_seq_scores)),
         "val_normal_runs": int(len(val_run_scores)),
@@ -338,32 +335,19 @@ def main():
 
     # Score ALL attack sequences: boundary sequences (label -1, partial spray
     # overlap) may contain spray events and often score high, so they must
-    # count toward the run-level max. They stay excluded from sequence-level
-    # metrics (ambiguous label), and from grouped/held-out breakdowns.
+    # count toward the run-level max. Evaluation is run-level only (the
+    # detection unit is "did this run contain a spray attack"); sequence
+    # scores are an intermediate aggregation, never reported as metrics.
     if is_token_model:
         attack_sequences_all = attack_seqs.astype(np.int32)
     else:
         attack_sequences_all = attack_seqs.astype(np.float32)
     attack_scores_all = common.score_sequences(model, attack_sequences_all, args.aggregation)
     del attack_sequences_all
-
-    attack_keep = attack_seq_labels >= 0  # subset for sequence-level metrics
-    attack_scores = attack_scores_all[attack_keep]
-    attack_labels = attack_seq_labels[attack_keep]
-    attack_groups_all = attack_seq_run_ids[attack_keep]
     score_seconds = time.perf_counter() - _t_score
     scored_sequences = len(test_scores) + len(attack_scores_all)
 
     if args.held_out_cve:
-        held_mask = np.array([g.startswith(args.held_out_cve + "/") for g in attack_groups_all])
-        dev_attack = ~held_mask
-        all_scores = np.concatenate((test_scores, attack_scores[dev_attack]))
-        all_labels = np.concatenate((test_labels, attack_labels[dev_attack]))
-        all_groups = np.concatenate((np.char.add("normal:", test_groups_arr),
-                                     np.char.add("attack:", attack_groups_all[dev_attack])))
-        held_scores = attack_scores[held_mask]
-        held_labels = attack_labels[held_mask]
-        held_groups = np.char.add("attack:", attack_groups_all[held_mask])
         # Run pool mirrors the dev subset (held-out CVE stays out of aggregate)
         held_mask_full = np.array([g.startswith(args.held_out_cve + "/")
                                    for g in attack_seq_run_ids])
@@ -373,11 +357,6 @@ def main():
             np.char.add("attack:", attack_seq_run_ids[~held_mask_full])))
         run_pool_labels = np.concatenate((test_labels, attack_seq_labels[~held_mask_full]))
     else:
-        all_scores = np.concatenate((test_scores, attack_scores))
-        all_labels = np.concatenate((test_labels, attack_labels))
-        all_groups = np.concatenate((np.char.add("normal:", test_groups_arr),
-                                     np.char.add("attack:", attack_groups_all)))
-        held_scores, held_labels, held_groups = None, None, None
         # Run pool includes ALL attack sequences (boundary included): run-level
         # max must see every sequence score of the run.
         run_pool_scores = np.concatenate((test_scores, attack_scores_all))
@@ -385,7 +364,6 @@ def main():
                                           np.char.add("attack:", attack_seq_run_ids)))
         run_pool_labels = np.concatenate((test_labels, attack_seq_labels))
 
-    seq_metrics = common.classification_metrics(all_scores, all_labels, threshold)
     run_scores, run_ids = common.run_max_scores(run_pool_scores, run_pool_groups)
     # Run-level label from run identity (data-source class), NOT derived from
     # sequence labels: an attack run stays attack even when none of its
@@ -409,22 +387,25 @@ def main():
     attack_runs_no_spray = sum(1 for g in attack_run_ids
                                if run_seq_label_max[g] < 1)
 
-    # grouped breakdowns (plan 9.4): by normal workload, attack CVE, variant, slab
-    normal_idx = np.asarray([g.startswith("normal:") for g in all_groups])
-    attack_idx = ~normal_idx
-    attack_cves = np.asarray([parse_group(g)[0] for g in all_groups[attack_idx]])
-    attack_variants = np.asarray(["/".join(parse_group(g)) for g in all_groups[attack_idx]])
+    # grouped breakdowns at RUN level: flagged-run counts per normal workload
+    # (per-workload false alarms) and per attack CVE/variant/slab (detection).
+    run_normal_idx = np.asarray([str(g).startswith("normal:") for g in run_ids])
+    run_attack_idx = ~run_normal_idx
+    attack_cves = np.asarray([parse_group(g)[0] for g in np.asarray(run_ids)[run_attack_idx]])
+    attack_variants = np.asarray(["/".join(parse_group(g))
+                                  for g in np.asarray(run_ids)[run_attack_idx]])
     attack_slabs = np.asarray([common.TARGET_SLAB.get(parse_group(g)[0], "unknown")
-                               for g in all_groups[attack_idx]])
+                               for g in np.asarray(run_ids)[run_attack_idx]])
     by_workload = common.grouped_metrics(
-        all_scores[normal_idx], all_labels[normal_idx],
-        np.asarray([parse_group(g)[1] for g in all_groups[normal_idx]]), threshold)
-    by_cve = common.grouped_metrics(all_scores[attack_idx], all_labels[attack_idx],
-                                    attack_cves, threshold)
-    by_variant = common.grouped_metrics(all_scores[attack_idx], all_labels[attack_idx],
-                                        attack_variants, threshold)
-    by_slab = common.grouped_metrics(all_scores[attack_idx], all_labels[attack_idx],
-                                     attack_slabs, threshold)
+        run_scores[run_normal_idx], run_labels[run_normal_idx],
+        np.asarray([parse_group(g)[1] for g in np.asarray(run_ids)[run_normal_idx]]),
+        run_threshold)
+    by_cve = common.grouped_metrics(run_scores[run_attack_idx], run_labels[run_attack_idx],
+                                    attack_cves, run_threshold)
+    by_variant = common.grouped_metrics(run_scores[run_attack_idx], run_labels[run_attack_idx],
+                                        attack_variants, run_threshold)
+    by_slab = common.grouped_metrics(run_scores[run_attack_idx], run_labels[run_attack_idx],
+                                     attack_slabs, run_threshold)
 
     evaluation_report = {
         "schema_version": 2,
@@ -432,7 +413,6 @@ def main():
         "model": args.model,
         "score_aggregation": args.aggregation,
         "held_out_cve": args.held_out_cve,
-        "sequence_level": seq_metrics,
         "run_level": run_metrics,
         "run_bootstrap_ci95": run_ci,
         "grouped": {"by_workload": by_workload, "by_cve": by_cve,
@@ -440,10 +420,10 @@ def main():
         "counts": {
             "test_normal_sequences": int(len(test_scores)),
             "test_normal_runs": int(len(set(test_groups_arr.tolist()))),
-            "attack_sequences_evaluated": int(len(attack_scores)),
-            "attack_spray_sequences": int(np.sum(attack_labels == 1)),
-            "attack_normal_context_sequences": int(np.sum(attack_labels == 0)),
-            "ignored_boundary_sequences": int(np.sum(~attack_keep)),
+            "attack_sequences_evaluated": int(len(attack_scores_all)),
+            "attack_spray_sequences": int(np.sum(attack_seq_labels == 1)),
+            "attack_normal_context_sequences": int(np.sum(attack_seq_labels == 0)),
+            "ignored_boundary_sequences": int(np.sum(attack_seq_labels < 0)),
             "attack_runs_total": len(attack_run_ids),
             "attack_runs_no_spray_sequence": attack_runs_no_spray,
         },
@@ -453,22 +433,36 @@ def main():
             "windows_per_second": round(float(scored_sequences * seq_len) / max(score_seconds, 1e-9), 1),
         },
     }
-    if held_scores is not None:
+    if args.held_out_cve:
+        # Held-out CVE run-level metrics: held attack runs paired with the same
+        # eval normal runs used in the aggregate (run-level AUC is comparable).
+        held_pool_scores = attack_scores_all[held_mask_full]
+        held_pool_groups = attack_seq_run_ids[held_mask_full]
+        if len(held_pool_scores):
+            held_run_scores, _ = common.run_max_scores(held_pool_scores, held_pool_groups)
+            normal_run_scores = run_scores[run_normal_idx]
+            held_metrics = common.classification_metrics(
+                np.concatenate((normal_run_scores, held_run_scores)),
+                np.concatenate((np.zeros(len(normal_run_scores), dtype=np.int8),
+                                np.ones(len(held_run_scores), dtype=np.int8))),
+                run_threshold)
+        else:
+            held_metrics = {"error": "no held-out attack runs"}
         evaluation_report["held_out_cve_metrics"] = {
             "cve": args.held_out_cve,
-            "sequence_level": common.classification_metrics(
-                held_scores, held_labels, threshold),
+            "run_level": held_metrics,
         }
     write_json(experiment_dir / "evaluation_report.json", evaluation_report)
 
     # ---- 6. gates G8 / G10 ---------------------------------------------------
-    g8_ok = bool(seq_metrics.get("roc_auc") is not None)
+    g8_ok = bool(run_metrics.get("roc_auc") is not None)
     gates.append({
         "name": "G8_train_evaluate_end_to_end",
         "ok": g8_ok,
         "detail": f"model={args.model} trained and evaluated; "
-                  f"test normal={len(test_scores)} sequences / "
-                  f"attack={int(np.sum(attack_labels == 1))} spray sequences",
+                  f"test normal={len(run_ids) - len(attack_run_ids)} runs / "
+                  f"attack={len(attack_run_ids)} runs "
+                  f"({int(np.sum(attack_seq_labels == 1))} spray sequences)",
     })
 
     baseline_run_flags = np.asarray(run_scores)[
@@ -495,9 +489,8 @@ def main():
     row = {"experiment_id": experiment, "model": args.model, "seed": args.seed,
            "target_fpr": args.target_fpr, "aggregation": args.aggregation,
            "held_out_cve": args.held_out_cve or "-"}
-    for level, m in (("seq", seq_metrics), ("run", run_metrics)):
-        for key in ("roc_auc", "pr_auc", "f1_at_threshold", "fpr_at_threshold"):
-            row[f"{level}_{key}"] = m.get(key, "")
+    for key in ("roc_auc", "pr_auc", "f1_at_threshold", "fpr_at_threshold"):
+        row[f"run_{key}"] = run_metrics.get(key, "")
     with open(experiment_dir / "metrics.csv", "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=sorted(row))
         writer.writeheader()

@@ -97,7 +97,7 @@ python3 scripts/train/run_experiment.py --model fusion_svdd \
 
 每个模型产出 `runs/<时间戳>_<模型>_s<seed>/`：
 - `model.pkl` — 训练好的模型
-- `evaluation_report.json` — 序列级和 run 级指标（AUC/F1/Precision/Recall）
+- `evaluation_report.json` — run 级指标（AUC/F1/Precision/Recall）+ 分组明细 + 诊断计数
 - `gates.json` — G7/G8/G10 门禁
 - `scaler.npz` — 归一化参数（token 模型无）
 - `split_manifest.json` — train/val/test run 划分

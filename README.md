@@ -193,8 +193,10 @@ python scripts/train/run_experiment.py --model fusion_svdd ...
 gates.json、split_manifest.json、metrics.csv、scaler.npz），含输入 sha256、git revision、
 配置摘要，可追溯。默认 `--seed 42`。
 
-评估：阈值 = 验证集正常 p99；逐 CVE AUC = 攻击内 spray-seq vs 上下文；run 级 = 每 run 最大
-窗口分数。
+评估（仅 run 级）：run 分数 = 该 run 全部序列分数的 max（边界序列计入）；
+run 标签 = 数据源身份（attack 目录 = 1，baseline 为负对照 0）；
+run_threshold = 验证集正常 run 分数的 p99（不优化测试集）。
+逐 CVE/变体/负载明细见 evaluation_report.grouped（run 级 flagged 计数）。
 
 ### 跨 CVE 实验
 
