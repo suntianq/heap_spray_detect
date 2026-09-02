@@ -1,0 +1,362 @@
+"""Event-embedding GRU anomaly detector (field-decomposed, phase 3).
+
+Replaces the discrete-symbol GRU (gru_detector.py). Where the old model
+collapsed every event into ONE opaque token id over a 13824-word vocab, this
+model decomposes each event into its constituent FIELDS, each mapped to its
+own learnable embedding (or a continuous scalar), and feeds the concatenated
+vector to a bidirectional GRU.
+
+Not an autoencoder. Training is still next-event self-supervision -- predict
+the next event's fields from the preceding events -- but the prediction target
+is a FIELD-WISE decomposition instead of one opaque symbol:
+
+  Field   shape(predicted)   encoding
+  ------  -----------------  ----------------------------------------------
+  op      2 classes          categorical (top-g hit)
+  size    12 buckets         categorical (top-g hit)
+  csrep   2 classes          "does next event reuse the current call_site?"
+  cpu     3 buckets          categorical (top-g hit)
+  reclaim 3 classes          categorical (top-g hit)
+  dt      continuous scalar  regression on log1p(dt_us), relative error
+
+Why field decomposition fixes the old model's weaknesses:
+
+  1. Vocab 13824 -> per-field vocab <=12. Normal next-event predictions rarely
+     miss; the fragile top-10-over-13824 test (high FPR) is gone.
+  2. behavior_type / frequency_rank are DROPPED. They were computed from the
+     global normal distribution and leaked a "rare == anomalous" prior into the
+     token, which is exactly what produced the run_FPR=0.09 on allocation-heavy
+     workloads (fork_stress > idle > mem_pressure).
+  3. call_site becomes a stable-hash embedding slot (CS_VOCAB), so unseen
+     call_sites are a fresh embedding, not a "rare" penalty. No global vocab.
+  4. dt is a continuous log1p(dt_us) scalar, not 4 coarse buckets -- spray's
+     sub-2us bursts are directly visible to the net.
+  5. The csrep head literally models "the next event repeats the same
+     call_site", which is the dominant spray signature (same call_site, same
+     size, <2us apart, hundreds of times).
+
+Input layout (from trace2tokens.cut_event_sequences): (N, L, 6) float32
+  [op, size_bucket, call_site_hash, cpu_bucket, reclaim_flag, dt_cont]
+Channels 0-4 are integer indices (stored as float), channel 5 is the
+continuous dt. The model converts channels 0-4 to long for embedding lookup.
+
+Interface is identical to GRUDetector: exposes sequence_model=True with
+fit_sequences / sequence_anomaly_score, so run_experiment.py dispatches to it
+unchanged. sequence_anomaly_score returns (N, L) per-position scores; the
+harness aggregates via "mean".
+"""
+
+import numpy as np
+import pickle
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Field embedding sizes. Chosen small: the fields are few-valued, and the
+# GRU is what carries temporal structure. Total = 60 + 1 (dt) = 61.
+OP_DIM = 4
+SIZE_DIM = 16
+CS_DIM = 32
+CPU_DIM = 4
+RECLAIM_DIM = 4
+FIELD_EMB_DIM = OP_DIM + SIZE_DIM + CS_DIM + CPU_DIM + RECLAIM_DIM  # 60
+
+# call_site hash table size. Actual call_sites number in the dozens; 4096
+# slots keep collisions negligible while never demanding a global vocab.
+CS_VOCAB = 4096
+
+# dt continuation scale: log1p(dt_us) / log1p(1e9). 1e9 us = ~16.7 min, a
+# generous upper bound; maps dt into roughly [0, 1] with no data-dependent
+# statistics (leak-safe). dt=0 for a sequence's first event.
+LOG_DT_NORM = float(np.log1p(1e9))
+
+
+# ---------------------------------------------------------------------------
+# Field helpers (mirror the layout produced by trace2tokens)
+# ---------------------------------------------------------------------------
+
+def dt_to_continuous(dt_ns):
+    """Map an inter-event delta (ns) to a continuous scalar in ~[0, 1]."""
+    dt_us = max(dt_ns, 0) / 1000.0
+    return float(np.log1p(dt_us) / LOG_DT_NORM)
+
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+
+class EventGRUNet(nn.Module):
+    """Field-embedding GRU with per-field next-event prediction heads.
+
+    x: (B, L, 6) float32 with channels [op, size, cs_hash, cpu, reclaim, dt].
+    Returns EventNetOut(next_logits, dt_pred) where next_logits is a dict of
+    per-field logits over positions 0..L-2 (predicting events 1..L-1).
+    """
+
+    def __init__(self, d_model, n_layers, dropout, cs_vocab=CS_VOCAB):
+        super().__init__()
+        self.d_model = d_model
+        self.cs_vocab = cs_vocab
+
+        self.op_emb = nn.Embedding(2, OP_DIM)
+        self.size_emb = nn.Embedding(12, SIZE_DIM)
+        self.cs_emb = nn.Embedding(cs_vocab, CS_DIM)
+        self.cpu_emb = nn.Embedding(3, CPU_DIM)
+        self.reclaim_emb = nn.Embedding(3, RECLAIM_DIM)
+
+        # Project field-embedding concat + continuous dt to GRU input dim.
+        self.field_proj = nn.Linear(FIELD_EMB_DIM + 1, d_model)
+
+        self.gru = nn.GRU(
+            d_model, d_model, num_layers=n_layers, batch_first=True,
+            bidirectional=True, dropout=dropout if n_layers > 1 else 0.0)
+
+        # Prediction heads (bidirectional GRU -> 2*d_model)
+        self.op_head = nn.Linear(2 * d_model, 2)
+        self.size_head = nn.Linear(2 * d_model, 12)
+        self.csrep_head = nn.Linear(2 * d_model, 2)
+        self.cpu_head = nn.Linear(2 * d_model, 3)
+        self.reclaim_head = nn.Linear(2 * d_model, 3)
+        self.dt_head = nn.Linear(2 * d_model, 1)
+
+    def _embed_fields(self, x):
+        """x (B, L, 6) -> (B, L, FIELD_EMB_DIM+1)."""
+        op = x[..., 0].long()
+        size = x[..., 1].long()
+        cs = x[..., 2].long().clamp(0, self.cs_vocab - 1)
+        cpu = x[..., 3].long()
+        reclaim = x[..., 4].long()
+        dt = x[..., 5:6]  # keep channel dim
+
+        emb = torch.cat([
+            self.op_emb(op),
+            self.size_emb(size),
+            self.cs_emb(cs),
+            self.cpu_emb(cpu),
+            self.reclaim_emb(reclaim),
+            dt,
+        ], dim=-1)  # (B, L, 61)
+        return emb
+
+    def forward(self, x):
+        """(B, L, 6) -> (next_logits dict, dt_pred). Positions 0..L-2 predict 1..L-1."""
+        emb = self._embed_fields(x)
+        h = self.field_proj(emb)  # (B, L, d_model)
+        out, _ = self.gru(h)      # (B, L, 2*d_model)
+        # Predict next event: out[..., :-1, :] -> logits for events[1:]
+        hn = out[:, :-1]
+        return {
+            "op": self.op_head(hn),
+            "size": self.size_head(hn),
+            "csrep": self.csrep_head(hn),
+            "cpu": self.cpu_head(hn),
+            "reclaim": self.reclaim_head(hn),
+        }, self.dt_head(hn)  # (B, L-1, 1)
+
+
+class EventGRUDetector:
+    """Field-decomposed next-event prediction anomaly detector.
+
+    Exposes sequence_model=True; fit_sequences / sequence_anomaly_score take
+    (N, L, 6) float32 field matrices. sequence_anomaly_score returns (N, L)
+    per-position scores in [0, 1]; the harness aggregates via "mean".
+    """
+
+    def __init__(self, seed=42, d_model=128, n_layers=2, dropout=0.1,
+                 lr=1e-3, epochs=20, batch_size=256, g_size=3,
+                 cs_vocab=CS_VOCAB, dt_loss_weight=1.0,
+                 w_op=0.05, w_size=0.35, w_csrep=0.20, w_cpu=0.05,
+                 w_reclaim=0.05, w_dt=0.30, device=None):
+        self.seed = seed
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.dropout = dropout
+        self.lr = lr
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.g_size = g_size  # top-g for the 12-way size head (other heads use argmax)
+        self.cs_vocab = cs_vocab
+        self.dt_loss_weight = dt_loss_weight
+        self.w_op = w_op
+        self.w_size = w_size
+        self.w_csrep = w_csrep
+        self.w_cpu = w_cpu
+        self.w_reclaim = w_reclaim
+        self.w_dt = w_dt
+        self.device = device
+        self.sequence_model = True
+        self.net = None
+        self.feat_dim = 6  # (N, L, 6) field matrix
+        self.n_fields = 6
+
+    def _make_net(self):
+        torch.manual_seed(self.seed)
+        device = self._device()
+        if device.type == "cpu":
+            torch.set_num_threads(1)
+        net = EventGRUNet(self.d_model, self.n_layers, self.dropout,
+                          self.cs_vocab)
+        return net.to(device)
+
+    def _device(self):
+        if self.device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif not isinstance(self.device, torch.device):
+            self.device = torch.device(self.device)
+        return self.device
+
+    # ---- training ----------------------------------------------------------
+
+    def fit_sequences(self, event_fields):
+        """Train field-wise next-event prediction on normal event matrices.
+
+        Args:
+            event_fields: (N, L, 6) float32 field matrix.
+        """
+        self.net = self._make_net()
+        device = self._device()
+
+        x = torch.from_numpy(np.asarray(event_fields, dtype=np.float32))
+        from torch.utils.data import DataLoader, TensorDataset
+        dataset = TensorDataset(x)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True,
+                            drop_last=False)
+
+        optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
+        self.net.train()
+
+        from tqdm import tqdm
+        epoch_pbar = tqdm(range(self.epochs), desc="EventGRU training",
+                          unit="epoch", leave=True)
+        for epoch in epoch_pbar:
+            total_loss = 0.0
+            n_batches = 0
+            for (xb,) in loader:
+                xb = xb.to(device)
+                inp = xb[:, :-1]  # (B, L-1, 6)
+                tgt = xb[:, 1:]   # (B, L-1, 6)
+                next_logits, dt_pred = self.net(xb)  # predict events[1:]
+
+                # Per-field targets (predicting the NEXT event)
+                op_t = tgt[..., 0].long()
+                size_t = tgt[..., 1].long()
+                # csrep: does the next event reuse the current call_site?
+                csrep_t = (tgt[..., 2].long() == inp[..., 2].long()).long()
+                cpu_t = tgt[..., 3].long()
+                reclaim_t = tgt[..., 4].long()
+                dt_t = tgt[..., 5]  # continuous
+
+                loss = (
+                    F.cross_entropy(next_logits["op"].reshape(-1, 2), op_t.reshape(-1))
+                    + F.cross_entropy(next_logits["size"].reshape(-1, 12), size_t.reshape(-1))
+                    + F.cross_entropy(next_logits["csrep"].reshape(-1, 2), csrep_t.reshape(-1))
+                    + F.cross_entropy(next_logits["cpu"].reshape(-1, 3), cpu_t.reshape(-1))
+                    + F.cross_entropy(next_logits["reclaim"].reshape(-1, 3), reclaim_t.reshape(-1))
+                    + self.dt_loss_weight * F.mse_loss(dt_pred.squeeze(-1), dt_t)
+                )
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), 1.0)
+                optimizer.step()
+                total_loss += loss.item()
+                n_batches += 1
+            avg_loss = total_loss / max(n_batches, 1)
+            epoch_pbar.set_postfix(loss=f"{avg_loss:.4f}")
+        epoch_pbar.close()
+        self.net.eval()
+        return self
+
+    # ---- scoring -----------------------------------------------------------
+
+    def sequence_anomaly_score(self, event_fields):
+        """Score field matrices with per-head hit/miss + dt relative error.
+
+        Per-position score = weighted sum of per-head misses and dt error,
+        clipped to [0, 1]. Returns (N, L). The harness aggregates via "mean".
+        """
+        device = self._device()
+        x = torch.from_numpy(np.asarray(event_fields, dtype=np.float32))
+        from torch.utils.data import DataLoader, TensorDataset
+        batch = min(self.batch_size, len(x))
+        loader = DataLoader(TensorDataset(x), batch_size=batch, shuffle=False)
+
+        from tqdm import tqdm
+        all_scores = []
+        with torch.no_grad():
+            for (xb,) in tqdm(loader, desc="EventGRU scoring", unit="batch", leave=True):
+                xb = xb.to(device)
+                inp = xb[:, :-1]      # (B, L-1, 6)
+                tgt = xb[:, 1:]       # (B, L-1, 6)
+                next_logits, dt_pred = self.net(xb)
+
+                op_hit = self._hit(next_logits["op"], tgt[..., 0].long(), 1)
+                size_hit = self._hit(next_logits["size"], tgt[..., 1].long(), self.g_size)
+                csrep_hit = self._hit(
+                    next_logits["csrep"],
+                    (tgt[..., 2].long() == inp[..., 2].long()).long(), 1)
+                cpu_hit = self._hit(next_logits["cpu"], tgt[..., 3].long(), 1)
+                reclaim_hit = self._hit(next_logits["reclaim"], tgt[..., 4].long(), 1)
+
+                # dt relative error, clipped to [0, 1]
+                dt_true = tgt[..., 5]
+                dt_err = ((dt_pred.squeeze(-1) - dt_true).abs()
+                          / (1.0 + dt_true.abs())).clamp(0, 1)
+
+                per_pos = (
+                    self.w_op * (1.0 - op_hit)
+                    + self.w_size * (1.0 - size_hit)
+                    + self.w_csrep * (1.0 - csrep_hit)
+                    + self.w_cpu * (1.0 - cpu_hit)
+                    + self.w_reclaim * (1.0 - reclaim_hit)
+                    + self.w_dt * dt_err
+                )  # (B, L-1)
+
+                # Pad the first position (no prediction available)
+                first = torch.zeros(xb.size(0), 1, device=device)
+                full = torch.cat([first, per_pos], dim=1)  # (B, L)
+                all_scores.append(full.cpu().numpy())
+
+        if not all_scores:
+            return np.zeros((len(x), x.size(1)), dtype=np.float64)
+        return np.concatenate(all_scores, axis=0)
+
+    @staticmethod
+    def _hit(logits, target, g):
+        """1.0 if target is in the top-g predicted classes, else 0.0.
+        Returns (B, L-1) float."""
+        if g <= 1:
+            pred = logits.argmax(dim=-1)
+            return (pred == target).float()
+        top_g = logits.topk(g, dim=-1).indices
+        return (top_g == target.unsqueeze(-1)).any(dim=-1).float()
+
+    # ---- persistence -------------------------------------------------------
+
+    def save(self, path):
+        with open(path, "wb") as f:
+            pickle.dump(
+                {"net_state": self.net.state_dict() if self.net else None,
+                 "config": {"seed": self.seed, "d_model": self.d_model,
+                            "n_layers": self.n_layers, "dropout": self.dropout,
+                            "lr": self.lr, "epochs": self.epochs,
+                            "batch_size": self.batch_size, "g_size": self.g_size,
+                            "cs_vocab": self.cs_vocab,
+                            "dt_loss_weight": self.dt_loss_weight,
+                            "w_op": self.w_op, "w_size": self.w_size,
+                            "w_csrep": self.w_csrep, "w_cpu": self.w_cpu,
+                            "w_reclaim": self.w_reclaim, "w_dt": self.w_dt}},
+                f)
+
+    @classmethod
+    def load(cls, path):
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        cfg = data["config"]
+        obj = cls(**cfg)
+        if data["net_state"] is not None:
+            obj.net = obj._make_net()
+            obj.net.load_state_dict(data["net_state"])
+            obj.net.eval()
+        return obj

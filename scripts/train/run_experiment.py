@@ -36,6 +36,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import config  # noqa: E402
 from models import OCSVMDetector, TorchAEWrapper  # noqa: E402
+from models.event_gru import EventGRUDetector  # noqa: E402
 from models.gru_detector import GRUDetector  # noqa: E402
 from models.fusion_svdd import FusionSVDDDetector  # noqa: E402
 from scripts.train import common  # noqa: E402
@@ -50,6 +51,8 @@ MODEL_FACTORY = {
     "lstm_vae": lambda seed: TorchAEWrapper("lstm_vae", seed=seed,
                                             epochs=25, seq_batch_size=64, beta=1.0),
     "gru": lambda seed: GRUDetector(seed=seed, epochs=20, batch_size=256, g=10),
+    "event_gru": lambda seed: EventGRUDetector(seed=seed, epochs=20, batch_size=256,
+                                               g_size=3),
     "fusion_svdd": lambda seed: FusionSVDDDetector(
         seed=seed, epochs=20, batch_size=256, g=10,
         svdd_loss_weight=0.1, svdd_score_weight=0.3),
@@ -62,6 +65,9 @@ MODEL_CONFIG = {
                  "lr": 1e-3, "beta": 1.0},
     "gru": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3, "g": 10,
             "vocab_size": 13824},
+    "event_gru": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3,
+                  "g_size": 3, "cs_vocab": 4096, "w_op": 0.05, "w_size": 0.35,
+                  "w_csrep": 0.20, "w_cpu": 0.05, "w_reclaim": 0.05, "w_dt": 0.30},
     "fusion_svdd": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3,
                     "g": 10, "svdd_loss_weight": 0.1, "svdd_score_weight": 0.3,
                     "vocab_size": 13824},
@@ -70,9 +76,17 @@ MODEL_CONFIG = {
 # Models that use token sequences (N, L) int32 instead of feature sequences (N, T, F) float32.
 TOKEN_MODELS = {"gru", "fusion_svdd"}
 
-# Default aggregation per model family: GRU/FusionSVDD uses mean (violation rate),
-# feature models use max (any-window anomaly).
-DEFAULT_AGGREGATION = {"gru": "mean", "fusion_svdd": "mean"}
+# Models that use the event-embedding field view (N, L, 6) float32 and fit an
+# end-to-end GRU (fit_sequences) with NO input scaler — like token models, they
+# skip the feature scaler; unlike token models, their data is not token ids.
+EVENT_MODELS = {"event_gru"}
+
+# Offline sequence models (token or event): never use feature windows / scaler.
+SEQUENCE_MODELS = TOKEN_MODELS | EVENT_MODELS
+
+# Default aggregation per model family: GRU/event-GRU/FusionSVDD uses mean
+# (violation rate), feature models use max (any-window anomaly).
+DEFAULT_AGGREGATION = {"gru": "mean", "event_gru": "mean", "fusion_svdd": "mean"}
 
 
 def make_experiment_dir(out_root, experiment_id):
@@ -193,8 +207,9 @@ def main():
         "python_version": sys.version.split()[0],
     })
 
-    # ---- load data (token or feature, depending on model) ------------------
+    # ---- load data (token / event / feature, depending on model) -----------
     is_token_model = args.model in TOKEN_MODELS
+    is_event_model = args.model in EVENT_MODELS
     if is_token_model:
         log.info("loading token sequences for model=%s", args.model)
         attack_tokens = common.load_token_data(Path(args.attack_data))
@@ -208,6 +223,19 @@ def main():
         feat_dim = 0
         attack_hash = sha256_file(os.path.join(args.attack_data, "token_sequences.npz"))
         normal_hash = sha256_file(os.path.join(args.normal_data, "token_sequences.npz"))
+    elif is_event_model:
+        log.info("loading event fields for model=%s", args.model)
+        attack_ev = common.load_event_data(Path(args.attack_data))
+        normal_ev = common.load_event_data(Path(args.normal_data))
+        attack_seqs = attack_ev["event_fields"]
+        attack_seq_labels = attack_ev["event_field_labels"]
+        attack_seq_run_ids = attack_ev["event_field_run_ids"]
+        normal_seqs = normal_ev["event_fields"]
+        normal_seq_run_ids = normal_ev["event_field_run_ids"]
+        seq_len = int(normal_seqs.shape[1])
+        feat_dim = int(normal_seqs.shape[2])
+        attack_hash = sha256_file(os.path.join(args.attack_data, "event_fields.npz"))
+        normal_hash = sha256_file(os.path.join(args.normal_data, "event_fields.npz"))
     else:
         attack, attack_stats = common.load_processed(Path(args.attack_data))
         normal, normal_stats = common.load_processed(Path(args.normal_data))
@@ -229,6 +257,7 @@ def main():
     cfg["inputs"]["attack_data_sha256"] = attack_hash
     cfg["inputs"]["normal_data_sha256"] = normal_hash
     cfg["is_token_model"] = is_token_model
+    cfg["is_event_model"] = is_event_model
     write_json(cfg_path, cfg)
 
     # ---- 1. run split (G7) ------------------------------------------------
@@ -241,9 +270,9 @@ def main():
     if not all(m.any() for m in (train_seq_mask, val_seq_mask, test_seq_mask)):
         raise ValueError("empty partition; adjust run counts")
 
-    # window mask only for feature models (token models have no windows)
+    # window mask only for feature models (token/event models have no windows)
     train_window_mask = None
-    if not is_token_model:
+    if not is_token_model and not is_event_model:
         train_window_mask = common.mask_for_groups(
             np.asarray(normal["window_run_ids"]).astype(str), train_groups)
         if not train_window_mask.any():
@@ -275,10 +304,11 @@ def main():
     dev = getattr(model, "_device", lambda: None)()
     log.info("model=%s device=%s", args.model, dev.type if dev is not None else "cpu")
 
-    if is_token_model:
-        train_tokens = normal_seqs[train_seq_mask].astype(np.int32)
-        model.fit_sequences(train_tokens)
-        log.info("model=%s trained on %d train token sequences", args.model, len(train_tokens))
+    if args.model in SEQUENCE_MODELS:
+        train_dtype = np.int32 if is_token_model else np.float32
+        train_seqs = normal_seqs[train_seq_mask].astype(train_dtype)
+        model.fit_sequences(train_seqs)
+        log.info("model=%s trained on %d train sequences", args.model, len(train_seqs))
     else:
         train_windows = normal["features"][train_window_mask].astype(np.float32)
         mean, std = common.fit_scaler(train_windows)
@@ -292,11 +322,11 @@ def main():
             log.info("model=%s trained on %d train windows", args.model, len(train_windows))
     save_model(model, experiment_dir / "model.pkl")
 
+    # dtype for sequence arrays: token ids vs float event/feature fields
+    seq_dtype = np.int32 if is_token_model else np.float32
+
     # ---- 3. threshold calibration on validation-normal FPR ------------------
-    if is_token_model:
-        val_sequences = normal_seqs[val_seq_mask].astype(np.int32)
-    else:
-        val_sequences = normal_seqs[val_seq_mask].astype(np.float32)
+    val_sequences = normal_seqs[val_seq_mask].astype(seq_dtype)
     val_groups_arr = normal_groups_all[val_seq_mask]
     val_seq_scores = common.score_sequences(model, val_sequences, args.aggregation)
     val_run_scores, val_run_ids = common.run_max_scores(val_seq_scores, val_groups_arr)
@@ -316,8 +346,8 @@ def main():
         "run_threshold": run_threshold,
         "val_normal_sequences": int(len(val_seq_scores)),
         "val_normal_runs": int(len(val_run_scores)),
-        "scaler_fit_on": "none (token model)" if is_token_model else "train_runs_only",
-        "scaler_npz": "none (token model)" if is_token_model else "scaler.npz",
+        "scaler_fit_on": "none (sequence model)" if args.model in SEQUENCE_MODELS else "train_runs_only",
+        "scaler_npz": "none (sequence model)" if args.model in SEQUENCE_MODELS else "scaler.npz",
         "seed": args.seed,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -325,10 +355,7 @@ def main():
 
     # ---- 5. evaluation on held-out test -------------------------------------
     _t_score = time.perf_counter()
-    if is_token_model:
-        test_sequences = normal_seqs[test_seq_mask].astype(np.int32)
-    else:
-        test_sequences = normal_seqs[test_seq_mask].astype(np.float32)
+    test_sequences = normal_seqs[test_seq_mask].astype(seq_dtype)
     test_groups_arr = normal_groups_all[test_seq_mask]
     test_scores = common.score_sequences(model, test_sequences, args.aggregation)
     test_labels = np.zeros(len(test_scores), dtype=np.int8)
@@ -338,10 +365,7 @@ def main():
     # count toward the run-level max. Evaluation is run-level only (the
     # detection unit is "did this run contain a spray attack"); sequence
     # scores are an intermediate aggregation, never reported as metrics.
-    if is_token_model:
-        attack_sequences_all = attack_seqs.astype(np.int32)
-    else:
-        attack_sequences_all = attack_seqs.astype(np.float32)
+    attack_sequences_all = attack_seqs.astype(seq_dtype)
     attack_scores_all = common.score_sequences(model, attack_sequences_all, args.aggregation)
     del attack_sequences_all
     score_seconds = time.perf_counter() - _t_score

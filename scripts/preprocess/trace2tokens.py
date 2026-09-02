@@ -17,11 +17,18 @@ Output: token_sequences.npz alongside features.npz in processed/{attack,normal}/
   token_seq_run_ids:   (N,) object  (same run_id format as features.npz)
   token_seq_labels:    (N,) int8    (1=spray, 0=normal, -1=boundary-drop)
   schema_version:      scalar
+Also writes event_fields.npz with the event-embedding field view used by
+models/event_gru.py:
+  event_fields:        (N, SEQ_LEN, 6) float32
+    [op, size_bucket, call_site_hash, cpu_bucket, reclaim_flag, dt_cont]
+  event_field_labels / event_field_run_ids: same alignment as token_seq_*
 
 Leak-safety: call_site profiles and dt thresholds are built from ALL normal
 data (like csv2features computes per-window features from all data). The
 train/val/test split is done later by run_experiment.py using run_ids, the
-same logic as for feature sequences.
+same logic as for feature sequences. The event-field view drops
+behavior_type/frequency_rank entirely; its call_site channel is a stable hash
+slot (crc32 mod 4096), so no global vocabulary of "unseen == rare" is built.
 """
 
 import argparse
@@ -30,6 +37,7 @@ import logging
 import os
 import re
 import sys
+import zlib
 import multiprocessing
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -51,6 +59,14 @@ VOCAB_SIZE = 2 * 12 * 4 * 4 * 4 * 3 * 3  # 13824 (7-tuple: op, size, behavior, f
 SEQ_LEN = 128
 STRIDE = SEQ_LEN // 2  # 50% overlap
 
+# Event-embedding field layout (see models/event_gru.py). The field matrix is
+# (N, L, 6) float32: [op, size_bucket, call_site_hash, cpu_bucket, reclaim_flag, dt_cont].
+# Channels 0-4 are integer indices; channel 5 is continuous log1p(dt_us)/log1p(1e9).
+# behavior_type / frequency_rank are deliberately NOT included: they are computed
+# from the global normal distribution and leak a "rare == anomalous" prior.
+EVENT_FIELD_SIZE = 6
+FIELD_CS_HASH_MOD = 4096  # call_site hash table size (stable across runs, no global vocab)
+
 SIZE_BUCKETS = tuple(config.SIZE_BUCKETS)
 OVERFLOW_BUCKET = len(SIZE_BUCKETS)
 CVE_RE = re.compile(r"CVE-\d{4}-\d+")
@@ -58,6 +74,28 @@ POC_RE = re.compile(r"(poc_cfh_[a-z0-9_]+?)(?=_run_|$)")
 
 # dt_bucket thresholds (microseconds), calibrated from normal data
 DT_THRESHOLDS_US = [2.0, 50.0, 1000.0]
+
+# dt continuation scale (must match models/event_gru.py): log1p(dt_us)/log1p(1e9).
+# 1e9 us = ~16.7 min, a generous upper bound; dt=0 for a sequence's first event.
+LOG_DT_NORM = float(np.log1p(1e9))
+
+
+def hash_call_site(call_site):
+    """Stable 0..FIELD_CS_HASH_MOD-1 slot for a call_site string.
+
+    Uses zlib.crc32 (not Python's built-in hash()) so the slot is identical
+    across processes, runs, and Python invocations. Unseen call_sites get a
+    fresh slot instead of being flagged "rare" by a global vocabulary.
+    """
+    if not call_site:
+        return 0
+    return zlib.crc32(call_site.encode("utf-8")) % FIELD_CS_HASH_MOD
+
+
+def dt_to_continuous(dt_ns):
+    """Map an inter-event delta (ns) to a continuous scalar in ~[0, 1]."""
+    dt_us = max(dt_ns, 0) / 1000.0
+    return float(np.log1p(dt_us) / LOG_DT_NORM)
 
 
 # ---------------------------------------------------------------------------
@@ -292,15 +330,25 @@ def _compute_cpu_buckets(events, window=32):
 
 
 def tokenize_run(events, profiles, spray_start=None, spray_end=None):
-    """Tokenize a run's events into token_ids + per-event labels.
+    """Tokenize a run's events into token_ids + per-event labels + fields.
 
-    Returns (tokens, event_labels) where tokens is list[int] and
-    event_labels is list[int] (1 if in spray window, 0 otherwise).
+    Returns (tokens, event_labels, event_fields) where:
+      tokens:       list[int]      legacy 7-tuple token id (for token models)
+      event_labels: list[int]      1 if in spray window, 0 otherwise
+      event_fields: (N, 6) ndarray float32, the event-embedding field matrix
+        [op, size_bucket, call_site_hash, cpu_bucket, reclaim_flag, dt_cont].
+
+    NOTE about the dt channel: channel 5 is the inter-event delta as a
+    continuous scalar in ~[0,1] (log1p(dt_us)/log1p(1e9)); the FIRST event of
+    each sequence carries dt=0. dt is computed here as the delta to the previous
+    event across the whole run, so a sequence's first position is zeroed by
+    cut_event_sequences, not here.
     """
     resolve_free_sizes(events)
     cpu_buckets = _compute_cpu_buckets(events)
     tokens = []
     event_labels = []
+    event_fields = []
     prev_ts = None
 
     for i, event in enumerate(events):
@@ -321,8 +369,10 @@ def tokenize_run(events, profiles, spray_start=None, spray_end=None):
 
         if prev_ts is not None:
             dt = dt_to_bucket(event["timestamp_ns"] - prev_ts)
+            dt_cont = dt_to_continuous(event["timestamp_ns"] - prev_ts)
         else:
             dt = 3
+            dt_cont = 0.0
         prev_ts = event["timestamp_ns"]
 
         cpu_b = cpu_buckets[i]
@@ -337,12 +387,14 @@ def tokenize_run(events, profiles, spray_start=None, spray_end=None):
 
         tokens.append(encode_token(op, sb, bt, fr, dt, cpu_b, reclaim_flag))
 
+        event_fields.append([op, sb, hash_call_site(cs), cpu_b, reclaim_flag, dt_cont])
+
         if spray_start is not None and spray_end is not None:
             event_labels.append(1 if spray_start <= event["timestamp_ns"] <= spray_end else 0)
         else:
             event_labels.append(0)
 
-    return tokens, event_labels
+    return tokens, event_labels, np.asarray(event_fields, dtype=np.float32)
 
 
 def cut_sequences(tokens, event_labels, run_id, seq_len=SEQ_LEN, stride=STRIDE):
@@ -373,6 +425,42 @@ def cut_sequences(tokens, event_labels, run_id, seq_len=SEQ_LEN, stride=STRIDE):
         seq_ids.append(run_id)
 
     return seqs, seq_labels, seq_ids
+
+
+def cut_event_sequences(event_fields, event_labels, run_id, seq_len=SEQ_LEN, stride=STRIDE):
+    """Cut the (N, 6) event field matrix into (n, seq_len, 6) chunks.
+
+    Uses the same window/stride/labeling scheme as cut_sequences so the two
+    views of the same run stay aligned. The first position of each sequence has
+    its dt channel zeroed (there is no "previous event" across the boundary).
+
+    Returns (field_seqs, seq_labels, seq_ids).
+    """
+    n = event_fields.shape[0]
+    if n < seq_len:
+        return [], [], []
+
+    field_seqs = []
+    seq_labels = []
+    seq_ids = []
+
+    for i in range(0, n - seq_len + 1, stride):
+        seq = event_fields[i:i + seq_len].copy()
+        seq[0, 5] = 0.0  # first event of the sequence has no prior delta
+        lbls = event_labels[i:i + seq_len]
+
+        if any(l == 1 for l in lbls) and not all(l == 1 for l in lbls):
+            sl = -1
+        elif any(l == 1 for l in lbls):
+            sl = 1
+        else:
+            sl = 0
+
+        field_seqs.append(seq)
+        seq_labels.append(sl)
+        seq_ids.append(run_id)
+
+    return field_seqs, seq_labels, seq_ids
 
 
 # ---------------------------------------------------------------------------
@@ -422,14 +510,21 @@ def _tokenize_run_worker(task):
     spray_start = spray_window.get("SPRAY_START") if spray_window else None
     spray_end = spray_window.get("SPRAY_END") if spray_window else None
 
-    tokens, event_labels = tokenize_run(events, _worker_profiles, spray_start, spray_end)
+    tokens, event_labels, event_fields = tokenize_run(events, _worker_profiles, spray_start, spray_end)
     seqs, seq_labels, seq_ids = cut_sequences(tokens, event_labels, run_id, seq_len, stride)
+    field_seqs = field_seq_labels = field_seq_ids = None
+    if event_fields.shape[0] >= seq_len:
+        field_seqs, field_seq_labels, field_seq_ids = cut_event_sequences(
+            event_fields, event_labels, run_id, seq_len, stride)
 
     return {
         "cls": cls,
         "seqs": seqs,
         "seq_labels": seq_labels,
         "seq_ids": seq_ids,
+        "field_seqs": field_seqs,
+        "field_seq_labels": field_seq_labels,
+        "field_seq_ids": field_seq_ids,
         "has_seqs": len(seqs) > 0,
     }
 
@@ -520,6 +615,8 @@ def main():
 
     attack_seqs, attack_labels, attack_ids = [], [], []
     normal_seqs, normal_labels, normal_ids = [], [], []
+    attack_fields, attack_field_labels, attack_field_ids = [], [], []
+    normal_fields, normal_field_labels, normal_field_ids = [], [], []
     for result in results:
         if result is None or not result["has_seqs"]:
             continue
@@ -535,6 +632,19 @@ def main():
             normal_seqs.extend(seqs)
             normal_labels.extend(seq_lbls)
             normal_ids.extend(seq_rids)
+
+        fields = result.get("field_seqs")
+        if fields is not None:
+            f_lbls = result["field_seq_labels"]
+            f_rids = result["field_seq_ids"]
+            if cls == "attack":
+                attack_fields.extend(fields)
+                attack_field_labels.extend(f_lbls)
+                attack_field_ids.extend(f_rids)
+            else:
+                normal_fields.extend(fields)
+                normal_field_labels.extend(f_lbls)
+                normal_field_ids.extend(f_rids)
 
     log.info("attack: %d sequences (spray=%d, normal=%d, boundary=%d)",
              len(attack_seqs),
@@ -561,6 +671,25 @@ def main():
     save_token_npz(proc_attack / "token_sequences.npz", attack_seqs, attack_labels, attack_ids)
     save_token_npz(proc_normal / "token_sequences.npz", normal_seqs, normal_labels, normal_ids)
 
+    # ---- Event-embedding fields (for models/event_gru.py) ----
+    def save_event_npz(path, field_seqs, labels, ids):
+        if not field_seqs:
+            log.warning("no event field sequences for %s, skipping", path)
+            return
+        np.savez_compressed(
+            str(path),
+            event_fields=np.asarray(field_seqs, dtype=np.float32),
+            event_field_labels=np.asarray(labels, dtype=np.int8),
+            event_field_run_ids=np.asarray(ids, dtype=object),
+            schema_version=np.asarray(config.DATASET_SCHEMA_VERSION),
+            seq_len=np.asarray(args.seq_len),
+            field_size=np.asarray(EVENT_FIELD_SIZE),
+            cs_hash_mod=np.asarray(FIELD_CS_HASH_MOD),
+        )
+
+    save_event_npz(proc_attack / "event_fields.npz", attack_fields, attack_field_labels, attack_field_ids)
+    save_event_npz(proc_normal / "event_fields.npz", normal_fields, normal_field_labels, normal_field_ids)
+
     # Metadata
     meta = {
         "schema_version": config.DATASET_SCHEMA_VERSION,
@@ -580,6 +709,15 @@ def main():
         "frequency_thresholds": freq_thresholds,
         "total_attack_sequences": len(attack_seqs),
         "total_normal_sequences": len(normal_seqs),
+        "event_field_layout": {
+            "channel": ["op", "size_bucket", "call_site_hash", "cpu_bucket",
+                        "reclaim_flag", "dt_cont"],
+            "size": EVENT_FIELD_SIZE,
+            "cs_hash_mod": FIELD_CS_HASH_MOD,
+            "field_formats": ["int", "int", "int", "int", "int", "float"],
+        },
+        "total_attack_event_sequences": len(attack_fields),
+        "total_normal_event_sequences": len(normal_fields),
         "git_revision": snapshot_git_revision()[0],
     }
     write_json_atomic(str(out_dir / "processed" / "tokens_meta.json"), meta)

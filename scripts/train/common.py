@@ -52,6 +52,25 @@ def load_token_data(proc_dir):
     return data
 
 
+def load_event_data(proc_dir):
+    """Load event_fields.npz for the event-embedding model (event_gru).
+
+    Returns dict with keys: event_fields (N,L,6) float32, event_field_labels,
+    event_field_run_ids. Channel layout of event_fields:
+      [op, size_bucket, call_site_hash, cpu_bucket, reclaim_flag, dt_cont]
+    """
+    event_path = proc_dir / "event_fields.npz"
+    if not event_path.exists():
+        raise FileNotFoundError(f"event_fields.npz not found in {proc_dir} "
+                                f"(run scripts/preprocess/trace2tokens.py first)")
+    data = np.load(str(event_path), allow_pickle=True)
+    return {
+        "event_fields": data["event_fields"],
+        "event_field_labels": np.asarray(data["event_field_labels"], dtype=np.int8),
+        "event_field_run_ids": np.asarray(data["event_field_run_ids"]).astype(str),
+    }
+
+
 def run_stratum(run_id):
     """Stratum key for a run id: the workload/variant path minus the run index.
 
