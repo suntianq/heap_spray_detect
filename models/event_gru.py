@@ -42,8 +42,14 @@ continuous dt. The model converts channels 0-4 to long for embedding lookup.
 
 Interface is identical to GRUDetector: exposes sequence_model=True with
 fit_sequences / sequence_anomaly_score, so run_experiment.py dispatches to it
-unchanged. sequence_anomaly_score returns (N, L) per-position scores; the
-harness aggregates via "mean".
+unchanged. sequence_anomaly_score returns (N, L) per-position NLL-surprise
+scores; the harness aggregates via "p90" by default (see DEFAULT_AGGREGATION).
+
+Scoring (unlike the old top-g hit/miss vote): each field's per-position
+cross-entropy NLL (dt: relative error) is z-scored against its training
+distribution and relu-clipped, then weighted-summed. A 0.99-confidence
+misprediction scores far above a 0.51 one, so the score is a continuous
+"surprise" rather than a binary vote. See sequence_anomaly_score.
 """
 
 import numpy as np
@@ -107,6 +113,7 @@ class EventGRUNet(nn.Module):
 
         # Project field-embedding concat + continuous dt to GRU input dim.
         self.field_proj = nn.Linear(FIELD_EMB_DIM + 1, d_model)
+        self.norm = nn.LayerNorm(d_model)
 
         self.gru = nn.GRU(
             d_model, d_model, num_layers=n_layers, batch_first=True,
@@ -142,7 +149,7 @@ class EventGRUNet(nn.Module):
     def forward(self, x):
         """(B, L, 6) -> (next_logits dict, dt_pred). Positions 0..L-2 predict 1..L-1."""
         emb = self._embed_fields(x)
-        h = self.field_proj(emb)  # (B, L, d_model)
+        h = self.norm(self.field_proj(emb))  # (B, L, d_model)
         out, _ = self.gru(h)      # (B, L, 2*d_model)
         # Predict next event: out[..., :-1, :] -> logits for events[1:]
         hn = out[:, :-1]
@@ -167,7 +174,8 @@ class EventGRUDetector:
                  lr=1e-3, epochs=20, batch_size=256, g_size=3,
                  cs_vocab=CS_VOCAB, dt_loss_weight=1.0,
                  w_op=0.05, w_size=0.35, w_csrep=0.20, w_cpu=0.05,
-                 w_reclaim=0.05, w_dt=0.30, device=None):
+                 w_reclaim=0.05, w_dt=0.30, device=None,
+                 label_smoothing=0.05, aggregation="p90"):
         self.seed = seed
         self.d_model = d_model
         self.n_layers = n_layers
@@ -185,13 +193,23 @@ class EventGRUDetector:
         self.w_reclaim = w_reclaim
         self.w_dt = w_dt
         self.device = device
+        self.label_smoothing = label_smoothing
+        # Per-position -> per-sequence aggregation. max is fragile (one noisy
+        # position flags a whole burst); mean washes a short spray window out of
+        # a long run. An upper quantile keeps "part of the run was anomalous"
+        # while discarding single-position spikes.
+        self.aggregation = aggregation
         self.sequence_model = True
         self.net = None
         self.feat_dim = 6  # (N, L, 6) field matrix
         self.n_fields = 6
+        # Per-field NLL calibration stats (mean/std over training normal runs).
+        # Filled by fit_sequences / calibrate_scoring. None until then.
+        self._score_stats = None
 
     def _make_net(self):
         torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
         device = self._device()
         if device.type == "cpu":
             torch.set_num_threads(1)
@@ -224,7 +242,8 @@ class EventGRUDetector:
                             drop_last=False)
 
         optimizer = torch.optim.Adam(self.net.parameters(), lr=self.lr)
-        self.net.train()
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=3)
 
         from tqdm import tqdm
         epoch_pbar = tqdm(range(self.epochs), desc="EventGRU training",
@@ -247,12 +266,18 @@ class EventGRUDetector:
                 reclaim_t = tgt[..., 4].long()
                 dt_t = tgt[..., 5]  # continuous
 
+                ls = self.label_smoothing
                 loss = (
-                    F.cross_entropy(next_logits["op"].reshape(-1, 2), op_t.reshape(-1))
-                    + F.cross_entropy(next_logits["size"].reshape(-1, 12), size_t.reshape(-1))
-                    + F.cross_entropy(next_logits["csrep"].reshape(-1, 2), csrep_t.reshape(-1))
-                    + F.cross_entropy(next_logits["cpu"].reshape(-1, 3), cpu_t.reshape(-1))
-                    + F.cross_entropy(next_logits["reclaim"].reshape(-1, 3), reclaim_t.reshape(-1))
+                    F.cross_entropy(next_logits["op"].reshape(-1, 2), op_t.reshape(-1),
+                                    label_smoothing=ls)
+                    + F.cross_entropy(next_logits["size"].reshape(-1, 12), size_t.reshape(-1),
+                                      label_smoothing=ls)
+                    + F.cross_entropy(next_logits["csrep"].reshape(-1, 2), csrep_t.reshape(-1),
+                                      label_smoothing=ls)
+                    + F.cross_entropy(next_logits["cpu"].reshape(-1, 3), cpu_t.reshape(-1),
+                                      label_smoothing=ls)
+                    + F.cross_entropy(next_logits["reclaim"].reshape(-1, 3), reclaim_t.reshape(-1),
+                                      label_smoothing=ls)
                     + self.dt_loss_weight * F.mse_loss(dt_pred.squeeze(-1), dt_t)
                 )
 
@@ -264,17 +289,107 @@ class EventGRUDetector:
                 n_batches += 1
             avg_loss = total_loss / max(n_batches, 1)
             epoch_pbar.set_postfix(loss=f"{avg_loss:.4f}")
+            scheduler.step(avg_loss)
         epoch_pbar.close()
         self.net.eval()
+        # Calibrate per-field z-score stats on the same normal training set.
+        self._compute_score_stats(event_fields)
         return self
 
     # ---- scoring -----------------------------------------------------------
 
-    def sequence_anomaly_score(self, event_fields):
-        """Score field matrices with per-head hit/miss + dt relative error.
+    def _compute_score_stats(self, event_fields):
+        """Fit per-field NLL calibration stats on normal training sequences.
 
-        Per-position score = weighted sum of per-head misses and dt error,
-        clipped to [0, 1]. Returns (N, L). The harness aggregates via "mean".
+        For each field, collect the per-position NLL (or dt relative error) over
+        the reference set and store (mean, std). Scoring then z-scores each
+        field's surprise so the six fields are on a comparable scale before the
+        weighted sum -- a binary hit/miss vote cannot do this (it treats a
+        0.51-confidence miss the same as a 0.99 miss).
+
+        Called at the end of fit_sequences. Stats are saved/loaded with the
+        model so scoring never needs the training data again.
+        """
+        device = self._device()
+        x = torch.from_numpy(np.asarray(event_fields, dtype=np.float32))
+        from torch.utils.data import DataLoader, TensorDataset
+        loader = DataLoader(TensorDataset(x), batch_size=self.batch_size, shuffle=False)
+
+        sums = {k: 0.0 for k in ("op", "size", "csrep", "cpu", "reclaim", "dt")}
+        sumsq = {k: 0.0 for k in sums}
+        count = 0
+        with torch.no_grad():
+            for (xb,) in loader:
+                xb = xb.to(device)
+                out, dt_err = self._field_surprise(xb)
+                out["dt"] = dt_err
+                for k in sums:
+                    v = out[k].detach().cpu().numpy()
+                    sums[k] += float(v.sum())
+                    sumsq[k] += float((v * v).sum())
+                    count += v.size
+        if count == 0:
+            self._score_stats = None
+            return self
+        stats = {}
+        for k in sums:
+            mean = sums[k] / count
+            var = sumsq[k] / count - mean * mean
+            stats[k] = (float(mean), float(max(var, 1e-12) ** 0.5))
+        self._score_stats = stats
+        return self
+
+    def _field_surprise(self, xb):
+        """Per-position per-field surprise for a batch (B, L, 6).
+
+        Returns (dict of (B, L-1) float tensors, ...) where each entry is the
+        cross-entropy NLL for categorical heads or the relative error for dt.
+        dt is returned separately so callers can reuse it.
+        """
+        inp = xb[:, :-1]      # (B, L-1, 6)
+        tgt = xb[:, 1:]       # (B, L-1, 6)
+        next_logits, dt_pred = self.net(xb)
+
+        op_t = tgt[..., 0].long()
+        size_t = tgt[..., 1].long()
+        csrep_t = (tgt[..., 2].long() == inp[..., 2].long()).long()
+        cpu_t = tgt[..., 3].long()
+        reclaim_t = tgt[..., 4].long()
+
+        out = {
+            "op": F.cross_entropy(next_logits["op"].reshape(-1, 2), op_t.reshape(-1),
+                                  reduction="none").reshape(op_t.shape),
+            "size": F.cross_entropy(next_logits["size"].reshape(-1, 12), size_t.reshape(-1),
+                                    reduction="none").reshape(size_t.shape),
+            "csrep": F.cross_entropy(next_logits["csrep"].reshape(-1, 2), csrep_t.reshape(-1),
+                                     reduction="none").reshape(csrep_t.shape),
+            "cpu": F.cross_entropy(next_logits["cpu"].reshape(-1, 3), cpu_t.reshape(-1),
+                                   reduction="none").reshape(cpu_t.shape),
+            "reclaim": F.cross_entropy(next_logits["reclaim"].reshape(-1, 3),
+                                       reclaim_t.reshape(-1),
+                                       reduction="none").reshape(reclaim_t.shape),
+        }
+        dt_true = tgt[..., 5]
+        dt_err = ((dt_pred.squeeze(-1) - dt_true).abs()
+                  / (1.0 + dt_true.abs())).clamp(0, 1)
+        return out, dt_err
+
+    def _zscore(self, values, key):
+        """z-score a per-position surprise tensor for one field, relu-clipped."""
+        stats = self._score_stats
+        if not stats or key not in stats:
+            return values  # uncalibrated fallback (model loaded w/o stats)
+        mean, std = stats[key]
+        z = (values - mean) / std
+        return torch.relu(z)
+
+    def sequence_anomaly_score(self, event_fields):
+        """Score field matrices with calibrated per-field NLL surprise.
+
+        Per-position score = weighted sum of per-field z-scored NLL surprise
+        (relu-clipped so below-normal surprise contributes 0). Unlike the old
+        top-g hit/miss vote, this keeps the magnitude of a misprediction: a
+        0.99-confidence miss scores far higher than a 0.51 one. Returns (N, L).
         """
         device = self._device()
         x = torch.from_numpy(np.asarray(event_fields, dtype=np.float32))
@@ -287,30 +402,15 @@ class EventGRUDetector:
         with torch.no_grad():
             for (xb,) in tqdm(loader, desc="EventGRU scoring", unit="batch", leave=True):
                 xb = xb.to(device)
-                inp = xb[:, :-1]      # (B, L-1, 6)
-                tgt = xb[:, 1:]       # (B, L-1, 6)
-                next_logits, dt_pred = self.net(xb)
-
-                op_hit = self._hit(next_logits["op"], tgt[..., 0].long(), 1)
-                size_hit = self._hit(next_logits["size"], tgt[..., 1].long(), self.g_size)
-                csrep_hit = self._hit(
-                    next_logits["csrep"],
-                    (tgt[..., 2].long() == inp[..., 2].long()).long(), 1)
-                cpu_hit = self._hit(next_logits["cpu"], tgt[..., 3].long(), 1)
-                reclaim_hit = self._hit(next_logits["reclaim"], tgt[..., 4].long(), 1)
-
-                # dt relative error, clipped to [0, 1]
-                dt_true = tgt[..., 5]
-                dt_err = ((dt_pred.squeeze(-1) - dt_true).abs()
-                          / (1.0 + dt_true.abs())).clamp(0, 1)
+                out, dt_err = self._field_surprise(xb)
 
                 per_pos = (
-                    self.w_op * (1.0 - op_hit)
-                    + self.w_size * (1.0 - size_hit)
-                    + self.w_csrep * (1.0 - csrep_hit)
-                    + self.w_cpu * (1.0 - cpu_hit)
-                    + self.w_reclaim * (1.0 - reclaim_hit)
-                    + self.w_dt * dt_err
+                    self.w_op * self._zscore(out["op"], "op")
+                    + self.w_size * self._zscore(out["size"], "size")
+                    + self.w_csrep * self._zscore(out["csrep"], "csrep")
+                    + self.w_cpu * self._zscore(out["cpu"], "cpu")
+                    + self.w_reclaim * self._zscore(out["reclaim"], "reclaim")
+                    + self.w_dt * self._zscore(dt_err, "dt")
                 )  # (B, L-1)
 
                 # Pad the first position (no prediction available)
@@ -322,22 +422,13 @@ class EventGRUDetector:
             return np.zeros((len(x), x.size(1)), dtype=np.float64)
         return np.concatenate(all_scores, axis=0)
 
-    @staticmethod
-    def _hit(logits, target, g):
-        """1.0 if target is in the top-g predicted classes, else 0.0.
-        Returns (B, L-1) float."""
-        if g <= 1:
-            pred = logits.argmax(dim=-1)
-            return (pred == target).float()
-        top_g = logits.topk(g, dim=-1).indices
-        return (top_g == target.unsqueeze(-1)).any(dim=-1).float()
-
     # ---- persistence -------------------------------------------------------
 
     def save(self, path):
         with open(path, "wb") as f:
             pickle.dump(
                 {"net_state": self.net.state_dict() if self.net else None,
+                 "score_stats": self._score_stats,
                  "config": {"seed": self.seed, "d_model": self.d_model,
                             "n_layers": self.n_layers, "dropout": self.dropout,
                             "lr": self.lr, "epochs": self.epochs,
@@ -346,7 +437,9 @@ class EventGRUDetector:
                             "dt_loss_weight": self.dt_loss_weight,
                             "w_op": self.w_op, "w_size": self.w_size,
                             "w_csrep": self.w_csrep, "w_cpu": self.w_cpu,
-                            "w_reclaim": self.w_reclaim, "w_dt": self.w_dt}},
+                            "w_reclaim": self.w_reclaim, "w_dt": self.w_dt,
+                            "label_smoothing": self.label_smoothing,
+                            "aggregation": self.aggregation}},
                 f)
 
     @classmethod
@@ -355,6 +448,7 @@ class EventGRUDetector:
             data = pickle.load(f)
         cfg = data["config"]
         obj = cls(**cfg)
+        obj._score_stats = data.get("score_stats")
         if data["net_state"] is not None:
             obj.net = obj._make_net()
             obj.net.load_state_dict(data["net_state"])

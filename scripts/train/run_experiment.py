@@ -84,9 +84,12 @@ EVENT_MODELS = {"event_gru"}
 # Offline sequence models (token or event): never use feature windows / scaler.
 SEQUENCE_MODELS = TOKEN_MODELS | EVENT_MODELS
 
-# Default aggregation per model family: GRU/event-GRU/FusionSVDD uses mean
-# (violation rate), feature models use max (any-window anomaly).
-DEFAULT_AGGREGATION = {"gru": "mean", "event_gru": "mean", "fusion_svdd": "mean"}
+# Default aggregation per model family. GRU/FusionSVDD use mean (violation
+# rate). event_gru uses an upper quantile (p90) instead: the spray window is a
+# short section of a long run, so mean dilutes the burst, while max lets a
+# single mispredicted position flag the whole run. p90 keeps "part of the run
+# was anomalous" without the single-point fragility.
+DEFAULT_AGGREGATION = {"gru": "mean", "event_gru": "p90", "fusion_svdd": "mean"}
 
 
 def make_experiment_dir(out_root, experiment_id):
@@ -166,8 +169,8 @@ def main():
     parser.add_argument("--val-fraction", type=float, default=common.DEFAULT_VAL_FRACTION)
     parser.add_argument("--test-fraction", type=float, default=common.DEFAULT_TEST_FRACTION)
     parser.add_argument("--target-fpr", type=float, default=common.DEFAULT_TARGET_FPR)
-    parser.add_argument("--aggregation", choices=["max", "last", "p90", "mean"], default=None,
-                        help="sequence score aggregation; default per model (gru=mean, others=max)")
+    parser.add_argument("--aggregation", default=None,
+                        help="sequence score aggregation (max|last|mean|pNN, default per model)")
     parser.add_argument("--held-out-cve", default=None,
                         help="leave-one-CVE-out: exclude this CVE's attack from aggregate eval")
     args = parser.parse_args()

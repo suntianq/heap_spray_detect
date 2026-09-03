@@ -133,10 +133,14 @@ def aggregate_scores(per_window, aggregation):
         return per_window[:, -1]
     if aggregation == "max":
         return per_window.max(axis=1)
-    if aggregation == "p90":
-        return np.percentile(per_window, 90, axis=1)
     if aggregation == "mean":
         return per_window.mean(axis=1)
+    # Arbitrary upper quantiles (p90/p95/p99...) are robust to single-position
+    # spikes while still capturing "part of the sequence was anomalous" -- the
+    # mean dilutes a short burst, max amplifies one noisy position.
+    if aggregation.startswith("p") and aggregation[1:].isdigit():
+        q = int(aggregation[1:])
+        return np.percentile(per_window, q, axis=1)
     raise ValueError(f"unknown score aggregation: {aggregation}")
 
 
