@@ -66,8 +66,9 @@ MODEL_CONFIG = {
     "gru": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3, "g": 10,
             "vocab_size": 13824},
     "event_gru": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3,
-                  "g_size": 3, "cs_vocab": 4096, "w_op": 0.05, "w_size": 0.35,
-                  "w_csrep": 0.20, "w_cpu": 0.05, "w_reclaim": 0.05, "w_dt": 0.30},
+                  "g_size": 3, "cs_vocab": 4096, "w_op": 0.05, "w_size": 0.25,
+                  "w_csrep": 0.15, "w_cpu": 0.05, "w_reclaim": 0.05,
+                  "w_life": 0.20, "w_dt": 0.25},
     "fusion_svdd": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3,
                     "g": 10, "svdd_loss_weight": 0.1, "svdd_score_weight": 0.3,
                     "vocab_size": 13824},
@@ -76,7 +77,7 @@ MODEL_CONFIG = {
 # Models that use token sequences (N, L) int32 instead of feature sequences (N, T, F) float32.
 TOKEN_MODELS = {"gru", "fusion_svdd"}
 
-# Models that use the event-embedding field view (N, L, 6) float32 and fit an
+# Models that use the event-embedding field view (N, L, 8) float32 and fit an
 # end-to-end GRU (fit_sequences) with NO input scaler — like token models, they
 # skip the feature scaler; unlike token models, their data is not token ids.
 EVENT_MODELS = {"event_gru"}

@@ -19,8 +19,9 @@ Output: token_sequences.npz alongside features.npz in processed/{attack,normal}/
   schema_version:      scalar
 Also writes event_fields.npz with the event-embedding field view used by
 models/event_gru.py:
-  event_fields:        (N, SEQ_LEN, 6) float32
-    [op, size_bucket, call_site_hash, cpu_bucket, reclaim_flag, dt_cont]
+  event_fields:        (N, SEQ_LEN, 8) float32
+    [op, size_bucket, call_site_hash, cpu_bucket, reclaim_flag,
+     lifecycle, dt_bucket, dt_cont]
   event_field_labels / event_field_run_ids: same alignment as token_seq_*
 
 Leak-safety: call_site profiles and dt thresholds are built from ALL normal
@@ -60,12 +61,31 @@ SEQ_LEN = 128
 STRIDE = SEQ_LEN // 2  # 50% overlap
 
 # Event-embedding field layout (see models/event_gru.py). The field matrix is
-# (N, L, 6) float32: [op, size_bucket, call_site_hash, cpu_bucket, reclaim_flag, dt_cont].
-# Channels 0-4 are integer indices; channel 5 is continuous log1p(dt_us)/log1p(1e9).
+# (N, L, 8) float32: [op, size_bucket, call_site_hash, cpu_bucket, reclaim_flag,
+# lifecycle, dt_bucket, dt_cont]. Channels 0-6 are integer indices; channel 7 is
+# continuous log1p(dt_us)/log1p(1e9).
 # behavior_type / frequency_rank are deliberately NOT included: they are computed
 # from the global normal distribution and leak a "rare == anomalous" prior.
-EVENT_FIELD_SIZE = 6
+EVENT_FIELD_SIZE = 8
 FIELD_CS_HASH_MOD = 4096  # call_site hash table size (stable across runs, no global vocab)
+
+# Object lifecycle state (design section 5.2), recovered from the ptr tracking
+# that csv2features.resolve_free_sizes already performs. This is the heap
+# grooming / UAF fingerprint the op+size+dt fields cannot express: REUSE means
+# "an ALLOC took back a ptr that was freed moments ago", which is exactly the
+# ALLOC/ALLOC/FREE/FREE/REUSE cycle a groom drives.
+LIFE_NEW = 0          # ALLOC of a ptr not recently freed
+LIFE_REUSE = 1        # ALLOC reclaiming a recently-freed ptr
+LIFE_FREE_SHORT = 2   # FREE of a short-lived object
+LIFE_FREE_MEDIUM = 3  # FREE of a medium-lived object
+LIFE_FREE_LONG = 4    # FREE of a long-lived object
+LIFE_UNKNOWN = 5      # FREE whose allocation was never observed (unresolved)
+LIFE_VOCAB = 6
+
+# Lifetime bucket thresholds (microseconds) separating SHORT/MEDIUM/LONG.
+# Fixed first-version values per design section 5.3; percentile calibration on
+# normal data is the documented follow-up.
+LIFETIME_THRESHOLDS_US = [100.0, 10_000.0]
 
 SIZE_BUCKETS = tuple(config.SIZE_BUCKETS)
 OVERFLOW_BUCKET = len(SIZE_BUCKETS)
@@ -74,6 +94,16 @@ POC_RE = re.compile(r"(poc_cfh_[a-z0-9_]+?)(?=_run_|$)")
 
 # dt_bucket thresholds (microseconds), calibrated from normal data
 DT_THRESHOLDS_US = [2.0, 50.0, 1000.0]
+
+# Inter-event delta buckets for the EVENT FIELD view (6 classes). Distinct from
+# DT_THRESHOLDS_US, which stays at 4 classes because it feeds the legacy
+# encode_token vocabulary. Boundaries fan out by decade from the sub-2us burst
+# regime to >10ms, giving the dt head enough resolution to model the whole
+# shape of the delta distribution. Measured on the CVE-first dataset, the
+# separating band is NOT sub-2us (normal traffic is ~52% sub-2us too) but the
+# 100us-1ms bucket: ~6% of normal deltas vs ~30% during spray.
+DT_FIELD_THRESHOLDS_US = [2.0, 10.0, 100.0, 1000.0, 10_000.0]
+DT_FIELD_VOCAB = len(DT_FIELD_THRESHOLDS_US) + 1  # 6
 
 # dt continuation scale (must match models/event_gru.py): log1p(dt_us)/log1p(1e9).
 # 1e9 us = ~16.7 min, a generous upper bound; dt=0 for a sequence's first event.
@@ -271,6 +301,52 @@ def dt_to_bucket(dt_ns):
         return 3
 
 
+def dt_to_field_bucket(dt_ns):
+    """Map an inter-event delta to one of DT_FIELD_VOCAB classes (event view).
+
+    Bucket 0 is the sub-2us spray burst regime; the remaining boundaries fan out
+    by decade. Used as both an embedded input and a prediction target by
+    models/event_gru.py, replacing the pure log1p regression whose gradient was
+    dominated by the common millisecond-scale gaps.
+    """
+    dt_us = max(dt_ns, 0) / 1000.0
+    for index, upper in enumerate(DT_FIELD_THRESHOLDS_US):
+        if dt_us < upper:
+            return index
+    return DT_FIELD_VOCAB - 1
+
+
+def lifecycle_state(event):
+    """Object lifecycle class for one event (design section 5.2).
+
+    Reads the annotations resolve_free_sizes() already writes onto each event:
+    reclaim_from_free for ALLOC, object_lifetime_ns for FREE. An ALLOC that
+    takes back a recently-freed ptr is REUSE; a FREE is classified by how long
+    its object lived; a FREE whose ALLOC was never observed is UNKNOWN.
+    """
+    if event["op"] == "ALLOC":
+        return LIFE_REUSE if event.get("reclaim_from_free", False) else LIFE_NEW
+    lifetime_ns = event.get("object_lifetime_ns")
+    if lifetime_ns is None:
+        return LIFE_UNKNOWN
+    lifetime_us = max(lifetime_ns, 0) / 1000.0
+    if lifetime_us < LIFETIME_THRESHOLDS_US[0]:
+        return LIFE_FREE_SHORT
+    if lifetime_us < LIFETIME_THRESHOLDS_US[1]:
+        return LIFE_FREE_MEDIUM
+    return LIFE_FREE_LONG
+
+
+def calibrate_lifetime_thresholds():
+    """Return fixed lifetime bucket thresholds (microseconds).
+
+    Mirrors calibrate_dt_thresholds(): the first version uses the fixed
+    100us / 10ms split from design section 5.3. Percentile calibration on normal
+    data is the documented follow-up once these prove workload-sensitive.
+    """
+    return list(LIFETIME_THRESHOLDS_US)
+
+
 def encode_token(op, size_bucket, behavior_type, frequency_rank, dt_bucket, cpu_bucket, reclaim_flag):
     """Encode 7-tuple as single int token_id (0..3455).
 
@@ -335,14 +411,16 @@ def tokenize_run(events, profiles, spray_start=None, spray_end=None):
     Returns (tokens, event_labels, event_fields) where:
       tokens:       list[int]      legacy 7-tuple token id (for token models)
       event_labels: list[int]      1 if in spray window, 0 otherwise
-      event_fields: (N, 6) ndarray float32, the event-embedding field matrix
-        [op, size_bucket, call_site_hash, cpu_bucket, reclaim_flag, dt_cont].
+      event_fields: (N, 8) ndarray float32, the event-embedding field matrix
+        [op, size_bucket, call_site_hash, cpu_bucket, reclaim_flag,
+         lifecycle, dt_bucket, dt_cont].
 
-    NOTE about the dt channel: channel 5 is the inter-event delta as a
-    continuous scalar in ~[0,1] (log1p(dt_us)/log1p(1e9)); the FIRST event of
-    each sequence carries dt=0. dt is computed here as the delta to the previous
-    event across the whole run, so a sequence's first position is zeroed by
-    cut_event_sequences, not here.
+    NOTE about the dt channels: channel 6 is the inter-event delta bucketed into
+    DT_FIELD_VOCAB classes and channel 7 is the same delta as a continuous scalar
+    in ~[0,1] (log1p(dt_us)/log1p(1e9)). The FIRST event of a run carries the
+    longest dt bucket and dt_cont=0. dt is computed here as the delta to the
+    previous event across the whole run, so a sequence's first position is reset
+    by cut_event_sequences, not here.
     """
     resolve_free_sizes(events)
     cpu_buckets = _compute_cpu_buckets(events)
@@ -368,10 +446,13 @@ def tokenize_run(events, profiles, spray_start=None, spray_end=None):
             fr = 3  # rare
 
         if prev_ts is not None:
-            dt = dt_to_bucket(event["timestamp_ns"] - prev_ts)
-            dt_cont = dt_to_continuous(event["timestamp_ns"] - prev_ts)
+            delta_ns = event["timestamp_ns"] - prev_ts
+            dt = dt_to_bucket(delta_ns)
+            dt_field = dt_to_field_bucket(delta_ns)
+            dt_cont = dt_to_continuous(delta_ns)
         else:
             dt = 3
+            dt_field = DT_FIELD_VOCAB - 1
             dt_cont = 0.0
         prev_ts = event["timestamp_ns"]
 
@@ -387,7 +468,8 @@ def tokenize_run(events, profiles, spray_start=None, spray_end=None):
 
         tokens.append(encode_token(op, sb, bt, fr, dt, cpu_b, reclaim_flag))
 
-        event_fields.append([op, sb, hash_call_site(cs), cpu_b, reclaim_flag, dt_cont])
+        event_fields.append([op, sb, hash_call_site(cs), cpu_b, reclaim_flag,
+                             lifecycle_state(event), dt_field, dt_cont])
 
         if spray_start is not None and spray_end is not None:
             event_labels.append(1 if spray_start <= event["timestamp_ns"] <= spray_end else 0)
@@ -428,11 +510,13 @@ def cut_sequences(tokens, event_labels, run_id, seq_len=SEQ_LEN, stride=STRIDE):
 
 
 def cut_event_sequences(event_fields, event_labels, run_id, seq_len=SEQ_LEN, stride=STRIDE):
-    """Cut the (N, 6) event field matrix into (n, seq_len, 6) chunks.
+    """Cut the (N, 8) event field matrix into (n, seq_len, 8) chunks.
 
     Uses the same window/stride/labeling scheme as cut_sequences so the two
     views of the same run stay aligned. The first position of each sequence has
-    its dt channel zeroed (there is no "previous event" across the boundary).
+    its dt channels reset (there is no "previous event" across the boundary):
+    dt_bucket becomes the longest bucket and dt_cont becomes 0, matching how
+    tokenize_run treats the first event of a run.
 
     Returns (field_seqs, seq_labels, seq_ids).
     """
@@ -446,7 +530,8 @@ def cut_event_sequences(event_fields, event_labels, run_id, seq_len=SEQ_LEN, str
 
     for i in range(0, n - seq_len + 1, stride):
         seq = event_fields[i:i + seq_len].copy()
-        seq[0, 5] = 0.0  # first event of the sequence has no prior delta
+        seq[0, 6] = DT_FIELD_VOCAB - 1  # no prior delta -> longest bucket
+        seq[0, 7] = 0.0                 # no prior delta -> zero continuous dt
         lbls = event_labels[i:i + seq_len]
 
         if any(l == 1 for l in lbls) and not all(l == 1 for l in lbls):
@@ -588,6 +673,7 @@ def main():
     profiles, freq_thresholds = build_call_site_profiles_from_stats(
         dict(merged_cs_sizes), dict(merged_cs_count))
     dt_thresholds = calibrate_dt_thresholds()
+    lifetime_thresholds = calibrate_lifetime_thresholds()
     log.info("call_site profiles: %d entries (p50=%.0f p80=%.0f p95=%.0f)",
              len(profiles), freq_thresholds["p50"], freq_thresholds["p80"],
              freq_thresholds["p95"])
@@ -711,10 +797,16 @@ def main():
         "total_normal_sequences": len(normal_seqs),
         "event_field_layout": {
             "channel": ["op", "size_bucket", "call_site_hash", "cpu_bucket",
-                        "reclaim_flag", "dt_cont"],
+                        "reclaim_flag", "lifecycle", "dt_bucket", "dt_cont"],
             "size": EVENT_FIELD_SIZE,
             "cs_hash_mod": FIELD_CS_HASH_MOD,
-            "field_formats": ["int", "int", "int", "int", "int", "float"],
+            "field_formats": ["int", "int", "int", "int", "int", "int", "int", "float"],
+            "field_vocabs": [2, 12, FIELD_CS_HASH_MOD, 3, 3, LIFE_VOCAB,
+                             DT_FIELD_VOCAB, None],
+            "lifecycle_states": ["NEW", "REUSE", "FREE_SHORT", "FREE_MEDIUM",
+                                 "FREE_LONG", "UNKNOWN"],
+            "lifetime_thresholds_us": lifetime_thresholds,
+            "dt_field_thresholds_us": list(DT_FIELD_THRESHOLDS_US),
         },
         "total_attack_event_sequences": len(attack_fields),
         "total_normal_event_sequences": len(normal_fields),
