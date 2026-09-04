@@ -34,9 +34,15 @@ import torch.nn.functional as F
 class GRUDetector:
     """Event-level next-token prediction anomaly detector.
 
-    Architecture: Embedding(vocab -> d_model) + N-layer bidirectional GRU +
-    Linear(d_model -> vocab). Trained with next-token cross-entropy on
+    Architecture: Embedding(vocab -> d_model) + N-layer CAUSAL (unidirectional)
+    GRU + Linear(d_model -> vocab). Trained with next-token cross-entropy on
     normal token sequences. Scored with top-g violation rate.
+
+    The GRU must be unidirectional: a bidirectional GRU's output at position t
+    concatenates a backward state that has already read token t+1 -- the
+    prediction target -- so the head can decode the answer instead of learning
+    the normal distribution, flattening the violation signal on normal and
+    anomalous input alike.
 
     The detector exposes sequence_model=True so run_experiment.py dispatches
     to fit_sequences / sequence_anomaly_score. sequence_anomaly_score returns
@@ -192,13 +198,13 @@ class GRUNet(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=None)
         self.gru = nn.GRU(
             d_model, d_model, num_layers=n_layers, batch_first=True,
-            bidirectional=True, dropout=dropout if n_layers > 1 else 0.0)
-        # bidirectional -> 2*d_model; project back to vocab
-        self.fc = nn.Linear(2 * d_model, vocab_size)
+            bidirectional=False, dropout=dropout if n_layers > 1 else 0.0)
+        # Causal GRU -> hidden size is d_model; position t sees tokens 0..t only
+        self.fc = nn.Linear(d_model, vocab_size)
 
     def forward(self, x):
         """(B, L) int64 -> (B, L, vocab) logits for next-token prediction."""
         emb = self.embedding(x)  # (B, L, d_model)
-        out, _ = self.gru(emb)  # (B, L, 2*d_model)
+        out, _ = self.gru(emb)  # (B, L, d_model), causal: out[:, t] sees 0..t
         logits = self.fc(out)  # (B, L, vocab)
         return logits

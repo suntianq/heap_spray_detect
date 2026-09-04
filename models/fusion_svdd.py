@@ -261,7 +261,21 @@ class FusionSVDDDetector:
 
 
 class FusionSVDDNet(nn.Module):
-    """Bidirectional GRU with two heads: next-token prediction + SVDD embedding."""
+    """Causal GRU with two heads: next-token prediction + SVDD embedding.
+
+    The GRU is unidirectional. The next-token head requires it: a bidirectional
+    output at position t concatenates a backward state that has already read
+    token t+1, so the head decodes the target instead of modelling it.
+
+    Note this constrains the SVDD head too, which on its own could legitimately
+    use backward context (hypersphere compactness is not a prediction task).
+    Feeding only the forward half to the next-token head would not be a safe
+    workaround here: with n_layers > 1, PyTorch feeds each layer the FULL
+    concatenated output of the layer below, so the top layer's forward half has
+    already absorbed backward context and is no longer causal. A shared causal
+    trunk is the correct fix; the SVDD head still sees the whole sequence
+    through the mean-pool over positions.
+    """
 
     def __init__(self, vocab_size, d_model, n_layers, dropout, svdd_dim):
         super().__init__()
@@ -269,16 +283,16 @@ class FusionSVDDNet(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.gru = nn.GRU(
             d_model, d_model, num_layers=n_layers, batch_first=True,
-            bidirectional=True, dropout=dropout if n_layers > 1 else 0.0)
+            bidirectional=False, dropout=dropout if n_layers > 1 else 0.0)
         # Head 1: next-token prediction
-        self.next_token_head = nn.Linear(2 * d_model, vocab_size)
+        self.next_token_head = nn.Linear(d_model, vocab_size)
         # Head 2: SVDD projection (project to lower-dim for tighter hypersphere)
-        self.svdd_head = nn.Linear(2 * d_model, svdd_dim)
+        self.svdd_head = nn.Linear(d_model, svdd_dim)
 
     def forward(self, x):
         """(B, L) int64 -> (next_logits (B,L,vocab), svdd_emb (B, svdd_dim))"""
         emb = self.embedding(x)          # (B, L, d_model)
-        out, _ = self.gru(emb)           # (B, L, 2*d_model)
+        out, _ = self.gru(emb)           # (B, L, d_model), out[:, t] sees 0..t
         next_logits = self.next_token_head(out)  # (B, L, vocab)
         svdd_emb = self.svdd_head(out)           # (B, L, svdd_dim)
         # Mean-pool over time for sequence-level SVDD embedding
