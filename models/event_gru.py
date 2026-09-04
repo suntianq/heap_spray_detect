@@ -4,7 +4,14 @@ Replaces the discrete-symbol GRU (gru_detector.py). Where the old model
 collapsed every event into ONE opaque token id over a 13824-word vocab, this
 model decomposes each event into its constituent FIELDS, each mapped to its
 own learnable embedding (or a continuous scalar), and feeds the concatenated
-vector to a bidirectional GRU.
+vector to a CAUSAL (unidirectional) GRU.
+
+The GRU must be unidirectional. A bidirectional GRU's output at position t is
+concat(forward h[0..t], backward h[t..L-1]), and the backward half has already
+read event t+1 -- the prediction target itself. The heads can then decode the
+answer straight out of the backward state, driving the NLL toward zero on
+normal AND anomalous input alike. That flattens the surprise signal: few false
+positives, but few detections either. Position t must see only events 0..t.
 
 Not an autoencoder. Training is still next-event self-supervision -- predict
 the next event's fields from the preceding events -- but the prediction target
@@ -151,16 +158,17 @@ class EventGRUNet(nn.Module):
 
         self.gru = nn.GRU(
             d_model, d_model, num_layers=n_layers, batch_first=True,
-            bidirectional=True, dropout=dropout if n_layers > 1 else 0.0)
+            bidirectional=False, dropout=dropout if n_layers > 1 else 0.0)
 
-        # Prediction heads (bidirectional GRU -> 2*d_model)
-        self.op_head = nn.Linear(2 * d_model, OP_VOCAB)
-        self.size_head = nn.Linear(2 * d_model, SIZE_VOCAB)
-        self.csrep_head = nn.Linear(2 * d_model, 2)
-        self.cpu_head = nn.Linear(2 * d_model, CPU_VOCAB)
-        self.reclaim_head = nn.Linear(2 * d_model, RECLAIM_VOCAB)
-        self.life_head = nn.Linear(2 * d_model, LIFE_VOCAB)
-        self.dt_head = nn.Linear(2 * d_model, DT_VOCAB)
+        # Prediction heads. Causal GRU -> hidden size is d_model (not 2*d_model):
+        # position t must be conditioned on events 0..t only, never on t+1.
+        self.op_head = nn.Linear(d_model, OP_VOCAB)
+        self.size_head = nn.Linear(d_model, SIZE_VOCAB)
+        self.csrep_head = nn.Linear(d_model, 2)
+        self.cpu_head = nn.Linear(d_model, CPU_VOCAB)
+        self.reclaim_head = nn.Linear(d_model, RECLAIM_VOCAB)
+        self.life_head = nn.Linear(d_model, LIFE_VOCAB)
+        self.dt_head = nn.Linear(d_model, DT_VOCAB)
 
     def _embed_fields(self, x):
         """x (B, L, 8) -> (B, L, FIELD_EMB_DIM+1)."""
@@ -189,7 +197,7 @@ class EventGRUNet(nn.Module):
         """(B, L, 8) -> dict of next-field logits. Positions 0..L-2 predict 1..L-1."""
         emb = self._embed_fields(x)
         h = self.norm(self.field_proj(emb))  # (B, L, d_model)
-        out, _ = self.gru(h)      # (B, L, 2*d_model)
+        out, _ = self.gru(h)      # (B, L, d_model), causal: out[:, t] sees 0..t
         # Predict next event: out[..., :-1, :] -> logits for events[1:]
         hn = out[:, :-1]
         return {
