@@ -163,15 +163,23 @@ def main():
     seq_len = int(normal_seqs.shape[1])
 
     # ---- normal run split ----------------------------------------------------
+    # Baseline runs (poc_cfh_baseline) are near-attack controls held out of the
+    # normal pool entirely: they never train, calibrate, or count as clean
+    # normal in eval (design decision 2026-09-07). normal_groups_all stays the
+    # full per-sequence array (masks must align with normal_seqs rows); baseline
+    # is excluded by never putting a baseline run id into the run pools below.
     normal_groups_all = normal_seq_run_ids
-    train_pool_groups = [g for g in set(normal_groups_all.tolist())
-                         if cve_of(g) in train_cves]
+    baseline_seq_mask, _ = common.split_baseline_groups(normal_groups_all)
+    baseline_groups_all = normal_seq_run_ids[baseline_seq_mask]
+    pure_normal_runs = sorted({g for g in set(normal_groups_all.tolist())
+                               if not common.is_baseline_run(g)})
+    train_pool_groups = [g for g in pure_normal_runs if cve_of(g) in train_cves]
     train_pool_groups.sort()
     tr_groups, val_groups, held_test_groups = common.split_run_groups(
         train_pool_groups, args.seed, args.val_fraction, args.test_fraction)
 
     eval_normal_groups = [g for g in held_test_groups if cve_of(g) in test_cves]
-    for g in sorted({x for x in normal_groups_all.tolist()}):
+    for g in pure_normal_runs:
         if cve_of(g) in test_cves and cve_of(g) not in train_cves:
             eval_normal_groups.append(g)
     eval_normal_groups = sorted(set(eval_normal_groups))
@@ -192,16 +200,22 @@ def main():
         "train_groups": tr_groups,
         "val_groups": val_groups,
         "eval_normal_groups": eval_normal_groups,
+        "baseline_held_out": sorted({str(g) for g in baseline_groups_all}),
+        "baseline_policy": "near-attack test set: excluded from train/val/test",
     }
     write_json(experiment_dir / "split_manifest.json", split_payload)
     g7_ok = (len(set(tr_groups) & set(val_groups)) == 0
              and len(set(tr_groups) & set(eval_normal_groups)) == 0
-             and len(set(val_groups) & set(eval_normal_groups)) == 0)
+             and len(set(val_groups) & set(eval_normal_groups)) == 0
+             and len(set(tr_groups) & set(baseline_groups_all)) == 0
+             and len(set(val_groups) & set(baseline_groups_all)) == 0
+             and len(set(eval_normal_groups) & set(baseline_groups_all)) == 0)
     gates = [{
         "name": "G7_run_split_no_overlap",
         "ok": g7_ok,
         "detail": f"train={len(tr_groups)} val={len(val_groups)} eval_normal={len(eval_normal_groups)} "
-                  f"runs, pairwise-disjoint={g7_ok}",
+                  f"runs (+{len(set(baseline_groups_all))} baseline held out), "
+                  f"pairwise-disjoint={g7_ok}",
     }]
 
     # ---- scaler + model fit ------------------------------------------------
@@ -277,6 +291,43 @@ def main():
     attack_scores_all = common.score_sequences_batched(
         model, attack_sequences_all, args.aggregation)
     del attack_sequences_all
+
+    # Baseline (near-attack) evaluation: score every baseline sequence at the
+    # frozen threshold, report per-run detection. Baseline executes the full
+    # exploit trigger path (no large spray); it is held out of the normal pool
+    # and reported as an independent quality axis, never folded into run_metrics.
+    baseline_seq_count = int(baseline_seq_mask.sum())
+    if baseline_seq_count:
+        baseline_scores = common.score_sequences_masked(model, normal_seqs,
+                                                        baseline_seq_mask,
+                                                        args.aggregation)
+        baseline_groups_arr = normal_groups_all[baseline_seq_mask]
+        baseline_run_scores, baseline_run_ids = common.run_max_scores(
+            baseline_scores, baseline_groups_arr)
+        baseline_run_flagged = np.asarray(baseline_run_scores) > run_threshold
+        baseline_report = {
+            "runs_total": int(len(baseline_run_scores)),
+            "runs_flagged": int(baseline_run_flagged.sum()),
+            "detection_rate": float(baseline_run_flagged.mean()) if len(baseline_run_flagged) else 0.0,
+            "by_cve": {},
+        }
+        baseline_run_id_arr = np.asarray(baseline_run_ids).astype(str)
+        baseline_cves = np.asarray([cve_of(g) for g in baseline_run_id_arr])
+        for cve in sorted({str(c) for c in baseline_cves}):
+            m = baseline_cves == cve
+            n = int(m.sum())
+            f = int(baseline_run_flagged[m].sum())
+            baseline_report["by_cve"][str(cve)] = {
+                "runs_total": n, "runs_flagged": f,
+                "detection_rate": float(f / n) if n else 0.0,
+            }
+        log.info("baseline near-attack: %d/%d runs flagged (detection_rate=%.2f)",
+                 baseline_report["runs_flagged"], baseline_report["runs_total"],
+                 baseline_report["detection_rate"])
+    else:
+        baseline_report = {"runs_total": 0, "runs_flagged": 0, "detection_rate": 0.0,
+                           "by_cve": {},
+                           "note": "no baseline runs in --normal-data"}
     score_seconds = time.perf_counter() - _t
 
     # Run pool includes ALL test-cve attack sequences (boundary included)
@@ -292,8 +343,8 @@ def main():
     # sequences carries label 1 (spray window diluted below sequence
     # granularity, or dropped by the boundary policy). The collector fixed the
     # run's class at collection time (PoC executed with spray markers).
-    # Baseline runs are collected under normal/ and are intentional negative
-    # controls (label 0, checked by gate G10).
+    # Baseline runs are NOT in this pool: they are held out and evaluated
+    # separately as a near-attack test set (see the baseline block above).
     run_labels = np.asarray([1 if str(g).startswith("attack:") else 0
                              for g in run_ids], dtype=np.int8)
     run_metrics = common.classification_metrics(run_scores, run_labels, run_threshold)
@@ -329,6 +380,7 @@ def main():
         "run_level": run_metrics,
         "run_bootstrap_ci95": run_ci,
         "grouped": {"by_cve": by_cve, "by_variant": by_variant},
+        "baseline_near_attack": baseline_report,
         "counts": {
             "test_normal_sequences": int(len(test_scores)),
             "test_normal_runs": int(len(set(test_groups_arr.tolist()))),
@@ -353,17 +405,16 @@ def main():
                             f"test normal={len(run_ids) - len(attack_run_ids)} runs / "
                             f"attack={len(attack_run_ids)} runs "
                             f"({int(np.sum(attack_seq_labels[test_attack_mask_all] == 1))} spray sequences)"})
-    baseline_flags = np.asarray(run_scores)[
-        np.asarray(["/poc_cfh_baseline/" in g for g in run_ids])] > run_threshold
-    n_base = int(len(baseline_flags))
-    n_flagged = int(baseline_flags.sum()) if n_base else 0
+    # G10 gate semantics changed with the baseline hold-out (2026-09-07): baseline
+    # is a near-attack test set, never a clean-normal negative. Informational gate.
+    n_base = int(baseline_seq_mask.sum())
     if n_base == 0:
-        gates.append({"name": "G10_baseline_not_flagged", "ok": True,
-                      "detail": "no baseline runs in test partition"})
+        gates.append({"name": "G10_baseline_held_out", "ok": True,
+                      "detail": "no baseline runs in --normal-data; near-attack detection not evaluated"})
     else:
-        allowed = 1 if n_base <= 5 else max(1, int(round(0.3 * n_base)))
-        gates.append({"name": "G10_baseline_not_flagged", "ok": n_flagged <= allowed,
-                      "detail": f"{n_flagged}/{n_base} baseline runs flagged (allowed <= {allowed})"})
+        gates.append({"name": "G10_baseline_held_out", "ok": True,
+                      "detail": f"{n_base} baseline sequences held out of train/val/test "
+                                f"(baseline_near_attack in evaluation_report.json)"})
     write_json(experiment_dir / "gates.json", gates)
 
     # metrics.csv

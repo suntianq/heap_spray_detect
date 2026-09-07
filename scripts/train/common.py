@@ -83,6 +83,39 @@ def run_stratum(run_id):
     return name
 
 
+# ---------------------------------------------------------------------------
+# Baseline separation (plan: baseline is a near-attack test set, never trains)
+#
+# The collector stores exploit-trigger-no-spray runs under baseline/ as
+# poc_cfh_baseline. The preprocessing flips them to class=normal, so they end
+# up inside processed/normal and the harness used to train on them. That is
+# wrong: baseline executes the full exploit path (trigger/overflow/hijack) with
+# only the large spray commented out, so it is a *near-attack* negative, not a
+# clean normal. It must be held out of train/val/test and scored on its own.
+# Detection is unambiguous because the run_id keeps the poc_cfh_baseline
+# workload/variant segment (e.g. CVE-2017-7308/poc_cfh_baseline/run_000_*/trace).
+# ---------------------------------------------------------------------------
+
+BASELINE_SEGMENT = "poc_cfh_baseline"
+
+
+def is_baseline_run(run_id):
+    """True if run_id belongs to a baseline (near-attack control) run."""
+    return f"/{BASELINE_SEGMENT}/" in f"/{run_id}"
+
+
+def split_baseline_groups(groups):
+    """Split a run-id array into (baseline, true_normal) index arrays.
+
+    Baseline sequences/runs carry the poc_cfh_baseline workload segment and
+    must be excluded from the normal train/val/test pool. Return boolean masks
+    over `groups` aligned with the input array.
+    """
+    groups = np.asarray(groups).astype(str)
+    is_base = np.array([is_baseline_run(g) for g in groups])
+    return is_base, ~is_base
+
+
 def split_run_groups(groups, seed, val_fraction=DEFAULT_VAL_FRACTION,
                      test_fraction=DEFAULT_TEST_FRACTION):
     """Split whole runs into train/val/test, stratified by workload/variant.

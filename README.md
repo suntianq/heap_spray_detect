@@ -87,8 +87,12 @@ datasets/raw/CVE-2017-11176/
 
 - **attack**：执行漏洞触发 + 堆喷，正样本（带 trace_marker 标记）。
 - **normal**：正常系统负载（8 类），负样本。
-- **baseline**：跑 exploit 触发路径但不喷雾，负样本中的对照组——用于 G10 门禁验证
-  检测器抓的是"喷雾现象"而非"存在 exploit"。
+- **baseline**：跑 exploit 触发路径但不喷雾（`poc_cfh_baseline`，只注释掉大堆喷）。
+  **设计定位（2026-09-07 起）：独立"近攻击"测试集，不进训练/校准**。预处理仍把
+  baseline 翻成 class=normal 并入 `processed/normal`，但 `run_experiment.py` /
+  `run_cve_split.py` 加载时按 run_id 的 `poc_cfh_baseline` 段将其整体剔除出
+  normal 池，单独打分，报告 `baseline_near_attack` 检出率（理想介于 normal FPR
+  与 attack recall 之间）。G10 门禁改为记录型（不再要求 baseline 不被误报）。
 
 ### 采集单个新 CVE（推荐，可续跑）
 
@@ -190,9 +194,11 @@ gates.json、split_manifest.json、metrics.csv、scaler.npz），含输入 sha25
 配置摘要，可追溯。默认 `--seed 42`。
 
 评估（仅 run 级）：run 分数 = 该 run 全部序列分数的 max（边界序列计入）；
-run 标签 = 数据源身份（attack 目录 = 1，baseline 为负对照 0）；
+run 标签 = 数据源身份（attack 目录 = 1，其余 = 0）；
 run_threshold = 验证集正常 run 分数的 p99（不优化测试集）。
 逐 CVE/变体/负载明细见 evaluation_report.grouped（run 级 flagged 计数）。
+baseline 不在该 run 池内（近攻击测试集被剔除），其检出率见
+evaluation_report.baseline_near_attack。
 
 ### 跨 CVE 实验
 

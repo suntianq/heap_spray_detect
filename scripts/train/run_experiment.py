@@ -258,16 +258,30 @@ def main():
     write_json(cfg_path, cfg)
 
     # ---- 1. run split (G7) ------------------------------------------------
+    # Baseline runs (poc_cfh_baseline) are near-attack controls that the
+    # collector executed through the full exploit path (no large spray). They
+    # must NOT train or calibrate the model, and must not be scored as clean
+    # normal: hold them out of the normal pool and evaluate them separately as
+    # a near-attack test set (see step 5). The run_id keeps the
+    # poc_cfh_baseline workload segment, so separation is exact.
     normal_groups_all = normal_seq_run_ids
+    baseline_seq_mask, true_normal_seq_mask = common.split_baseline_groups(normal_groups_all)
+    baseline_groups_all = normal_seq_run_ids[baseline_seq_mask]
+    normal_groups_true = normal_seq_run_ids[true_normal_seq_mask]
+    if not len(baseline_groups_all):
+        log.warning("no baseline runs found in --normal-data; near-attack eval empty")
     train_groups, val_groups, test_groups = common.split_run_groups(
-        normal_groups_all, args.seed, args.val_fraction, args.test_fraction)
+        normal_groups_true, args.seed, args.val_fraction, args.test_fraction)
     train_seq_mask = common.mask_for_groups(normal_groups_all, train_groups)
     val_seq_mask = common.mask_for_groups(normal_groups_all, val_groups)
     test_seq_mask = common.mask_for_groups(normal_groups_all, test_groups)
     if not all(m.any() for m in (train_seq_mask, val_seq_mask, test_seq_mask)):
         raise ValueError("empty partition; adjust run counts")
 
-    # window mask only for feature models (token/event models have no windows)
+    # window mask only for feature models (token/event models have no windows).
+    # Baseline windows are excluded because the training run pool excludes
+    # baseline runs (mask_for_groups over train_groups, which never contains a
+    # baseline run id).
     train_window_mask = None
     if not is_token_model and not is_event_model:
         train_window_mask = common.mask_for_groups(
@@ -284,16 +298,22 @@ def main():
         "val_groups": val_groups,
         "test_groups": test_groups,
         "held_out_cve": args.held_out_cve,
+        "baseline_held_out": sorted({str(g) for g in baseline_groups_all}),
+        "baseline_policy": "near-attack test set: excluded from train/val/test",
     }
     write_json(experiment_dir / "split_manifest.json", split_payload)
     g7_ok = (len(set(train_groups) & set(val_groups)) == 0
              and len(set(train_groups) & set(test_groups)) == 0
-             and len(set(val_groups) & set(test_groups)) == 0)
+             and len(set(val_groups) & set(test_groups)) == 0
+             and len(set(train_groups) & set(baseline_groups_all)) == 0
+             and len(set(val_groups) & set(baseline_groups_all)) == 0
+             and len(set(test_groups) & set(baseline_groups_all)) == 0)
     gates = [{
         "name": "G7_run_split_no_overlap",
         "ok": g7_ok,
         "detail": f"train={len(train_groups)} val={len(val_groups)} test={len(test_groups)} "
-                  f"runs, pairwise-disjoint={g7_ok}",
+                  f"runs (+{len(set(baseline_groups_all))} baseline held out), "
+                  f"pairwise-disjoint={g7_ok}",
     }]
 
     # ---- 2. scaler + model fit (token models skip scaler) ------------------
@@ -377,6 +397,48 @@ def main():
     attack_sequences_all = attack_seqs.astype(seq_dtype)
     attack_scores_all = common.score_sequences(model, attack_sequences_all, args.aggregation)
     del attack_sequences_all
+
+    # Baseline (near-attack) evaluation: score every baseline run held out of
+    # train/val/test at the SAME frozen threshold, report the detection rate per
+    # CVE. Baseline executes the full exploit trigger path (no large spray), so
+    # a detector of spray-vs-clean behaviour should flag it *more* than normal
+    # but *less* than attack; the rate is an independent quality axis, never
+    # folded into run_metrics (normal-vs-attack).
+    baseline_sequences = normal_seqs[baseline_seq_mask].astype(seq_dtype)
+    baseline_groups_arr = normal_groups_all[baseline_seq_mask]
+    if len(baseline_sequences):
+        baseline_scores = common.score_sequences(model, baseline_sequences, args.aggregation)
+        baseline_run_scores, baseline_run_ids = common.run_max_scores(
+            baseline_scores, baseline_groups_arr)
+        baseline_run_flagged = np.asarray(baseline_run_scores) > run_threshold
+        baseline_report = {
+            "runs_total": int(len(baseline_run_scores)),
+            "runs_flagged": int(baseline_run_flagged.sum()),
+            "detection_rate": float(baseline_run_flagged.mean()) if len(baseline_run_flagged) else 0.0,
+            "by_cve": {},
+        }
+        # baseline run ids are unprefixed (CVE/sub/run_.../trace) -- parse_group
+        # expects the "normal:"/"attack:" class prefix used on the run pool, so
+        # extract the CVE segment directly instead.
+        baseline_run_id_arr = np.asarray(baseline_run_ids).astype(str)
+        baseline_cves = np.asarray([str(g).split("/", 1)[0] for g in baseline_run_id_arr])
+        for cve in sorted({str(c) for c in baseline_cves}):
+            m = baseline_cves == cve
+            n = int(m.sum())
+            f = int(baseline_run_flagged[m].sum())
+            baseline_report["by_cve"][str(cve)] = {
+                "runs_total": n, "runs_flagged": f,
+                "detection_rate": float(f / n) if n else 0.0,
+            }
+        log.info("baseline near-attack: %d/%d runs flagged "
+                 "(detection_rate=%.2f) at run_threshold=%.6f",
+                 baseline_report["runs_flagged"], baseline_report["runs_total"],
+                 baseline_report["detection_rate"], run_threshold)
+        del baseline_sequences
+    else:
+        baseline_report = {"runs_total": 0, "runs_flagged": 0, "detection_rate": 0.0,
+                           "by_cve": {},
+                           "note": "no baseline runs in --normal-data"}
     score_seconds = time.perf_counter() - _t_score
     scored_sequences = len(test_scores) + len(attack_scores_all)
 
@@ -403,8 +465,8 @@ def main():
     # sequences carries label 1 (spray window diluted below sequence
     # granularity, or dropped by the boundary policy). The collector fixed the
     # run's class at collection time (PoC executed with spray markers).
-    # Baseline runs are collected under normal/ and are intentional negative
-    # controls (label 0, checked by gate G10).
+    # Baseline runs are NOT part of this pool: they are held out and evaluated
+    # separately as a near-attack test set (see the baseline block below).
     run_labels = np.asarray([1 if str(g).startswith("attack:") else 0
                              for g in run_ids], dtype=np.int8)
     run_metrics = common.classification_metrics(run_scores, run_labels, run_threshold)
@@ -450,6 +512,7 @@ def main():
         "run_bootstrap_ci95": run_ci,
         "grouped": {"by_workload": by_workload, "by_cve": by_cve,
                     "by_variant": by_variant, "by_slab": by_slab},
+        "baseline_near_attack": baseline_report,
         "counts": {
             "test_normal_sequences": int(len(test_scores)),
             "test_normal_runs": int(len(set(test_groups_arr.tolist()))),
@@ -498,21 +561,27 @@ def main():
                   f"({int(np.sum(attack_seq_labels == 1))} spray sequences)",
     })
 
-    baseline_run_flags = np.asarray(run_scores)[
-        np.asarray(["/poc_cfh_baseline/" in g for g in run_ids])] > run_threshold
-    n_base_runs = int(len(baseline_run_flags))
-    n_baseline = int(baseline_run_flags.sum()) if n_base_runs else 0
-    if n_base_runs == 0:
-        gates.append({"name": "G10_baseline_not_flagged", "ok": True,
-                      "detail": "no baseline runs in test partition -- not checked"})
+    # G10 gate semantics changed with the baseline hold-out (design decision
+    # 2026-09-07): baseline is no longer a clean-normal negative that must stay
+    # unflagged. It is a near-attack test set held out of train/val/test and
+    # scored at the frozen threshold; its detection rate is reported as an
+    # independent quality axis (see baseline_near_attack in evaluation_report)
+    # and recorded here. There is no hard pass/fail target yet -- where the rate
+    # should sit between the normal FPR and attack recall is exactly what these
+    # held-out experiments measure. Gate stays informational (ok=True) so a
+    # detector that flags many baseline runs is observed, not silently hidden.
+    if baseline_report.get("runs_total", 0) == 0:
+        gates.append({"name": "G10_baseline_held_out", "ok": True,
+                      "detail": "no baseline runs in --normal-data; near-attack "
+                                "detection not evaluated"})
     else:
-        allowed = 1 if n_base_runs <= 5 else max(1, int(round(0.3 * n_base_runs)))
-        g10_ok = n_baseline <= allowed
         gates.append({
-            "name": "G10_baseline_not_flagged",
-            "ok": g10_ok,
-            "detail": f"{n_baseline}/{n_base_runs} baseline runs flagged at run_threshold "
-                      f"(allowed <= {allowed})",
+            "name": "G10_baseline_held_out",
+            "ok": True,
+            "detail": (f"{baseline_report['runs_flagged']}/{baseline_report['runs_total']} "
+                       f"baseline runs flagged at run_threshold={run_threshold:.6f} "
+                       f"(detection_rate={baseline_report['detection_rate']:.3f}); "
+                       f"held out of train/val/test"),
         })
 
     write_json(experiment_dir / "gates.json", gates)
@@ -524,6 +593,9 @@ def main():
            "held_out_cve": args.held_out_cve or "-"}
     for key in ("roc_auc", "pr_auc", "f1_at_threshold", "fpr_at_threshold"):
         row[f"run_{key}"] = run_metrics.get(key, "")
+    row["baseline_runs_total"] = baseline_report.get("runs_total", "")
+    row["baseline_runs_flagged"] = baseline_report.get("runs_flagged", "")
+    row["baseline_detection_rate"] = baseline_report.get("detection_rate", "")
     with open(experiment_dir / "metrics.csv", "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=sorted(row))
         writer.writeheader()
