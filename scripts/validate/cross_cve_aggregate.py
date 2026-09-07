@@ -25,7 +25,7 @@ SCENARIOS = {
     "cveABC_testC":    ("ABC→C",    "数据增强"),
     "cveC_testAB":     ("C→AB",     "反向迁移"),
 }
-MODELS = ["ocsvm", "mlp_ae", "lstm_ae", "lstm_vae"]
+MODELS = ["ocsvm", "mlp_ae"]
 
 DIR_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})_(cve[^_]+_[^_]+)_v2_([a-z_0-9]+)_s(\d+)_(\d{6})$")
 

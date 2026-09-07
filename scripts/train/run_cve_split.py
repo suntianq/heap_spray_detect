@@ -37,7 +37,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import config  # noqa: E402
-from models import OCSVMDetector, TorchAEWrapper  # noqa: E402
+from models import OCSVMDetector  # noqa: E402
 from models.gru_detector import GRUDetector  # noqa: E402
 from models.fusion_svdd import FusionSVDDDetector  # noqa: E402
 from scripts.train import common  # noqa: E402
@@ -47,10 +47,6 @@ log = logging.getLogger("run_cve_split")
 
 MODEL_FACTORY = {
     "ocsvm": lambda seed: OCSVMDetector(kernel="rbf", nu=0.05, gamma="scale"),
-    "lstm_ae": lambda seed: TorchAEWrapper("lstm_ae", seed=seed,
-                                           epochs=25, seq_batch_size=64),
-    "lstm_vae": lambda seed: TorchAEWrapper("lstm_vae", seed=seed,
-                                            epochs=25, seq_batch_size=64, beta=1.0),
     "gru": lambda seed: GRUDetector(seed=seed, epochs=20, batch_size=256, g=10),
     "fusion_svdd": lambda seed: FusionSVDDDetector(
         seed=seed, epochs=20, batch_size=256, g=10,
@@ -59,9 +55,6 @@ MODEL_FACTORY = {
 
 MODEL_CONFIG = {
     "ocsvm": {"kernel": "rbf", "nu": 0.05, "gamma": "scale"},
-    "lstm_ae": {"hidden_dim": 64, "latent_dim": 16, "num_layers": 2, "epochs": 25, "lr": 1e-3},
-    "lstm_vae": {"hidden_dim": 64, "latent_dim": 16, "num_layers": 2, "epochs": 25,
-                 "lr": 1e-3, "beta": 1.0},
     "gru": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3, "g": 10,
             "vocab_size": 13824},
     "fusion_svdd": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3,

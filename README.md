@@ -38,18 +38,16 @@ QEMU guest 采集 (ftrace kmalloc/kfree + trace_marker)
 heap_spray/
 ├── config.py                          # 全局配置（路径、CVE 列表、特征/超参）
 ├── requirements.txt                   # 真机依赖清单（仅 numpy）
-├── models/                            # 检测模型（torch AE 包装 + sklearn）
-│   ├── torch_ae.py                    # TorchAEWrapper：sequence 训练打分胶水
+├── models/                            # 检测模型（torch + sklearn）
 │   ├── gru_detector.py                # 事件级 GRU + top-g 违例评分
 │   ├── fusion_svdd.py                 # 统一 GRU + Deep SVDD 双头
-│   ├── lstm_ae.py / lstm_vae.py       # 深度学习自编码器（nn.Module）
+│   ├── event_gru.py                   # 字段化事件嵌入 GRU
 │   └── ocsvm.py                       # One-Class SVM（ThunderSVM GPU 自动适配）
 ├── scripts/
 │   ├── collect/                       # QEMU 采集
 │   │   ├── collect_stable.py          # normal 采集（8 类负载）
 │   │   ├── collect_attack_stable.py   # attack/baseline 采集（含 trace_marker）
 │   │   ├── collect_cve_complete.sh    # 单个新 CVE 的全量采集编排（可续跑）
-│   │   ├── run_final_v2.sh            # 完整流水线编排（采集+build+train+report）
 │   │   ├── trace_helpers/             # guest 内 ftrace 启停脚本
 │   │   └── workloads/                 # 负载 C 源码（guest 内编译）
 │   ├── preprocess/                    # trace2csv.py → csv2features.py
@@ -169,8 +167,6 @@ csv2features → pilot_gates（G1–G6+G9）。产出 `processed/{attack,normal}
 | 模型 | 类型 | 评分单元 |
 |------|------|---------|
 | **ocsvm**（基线） | One-Class SVM | 窗口级 |
-| lstm_ae | LSTM 自编码器 | 序列级 |
-| lstm_vae | LSTM 变分自编码器（β 退火 + free bits） | 序列级 |
 | **gru** | 事件级 GRU（next-token + top-g 违例） | 事件级 |
 | **fusion_svdd**（主力） | 统一 GRU + Deep SVDD 双头 | 事件级 |
 

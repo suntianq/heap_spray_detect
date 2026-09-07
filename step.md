@@ -39,12 +39,6 @@ CVE=CVE-2017-7533 nohup scripts/collect/collect_cve_complete.sh \
 
 依次采集 attack（single_spray + combo）→ baseline → normal（7 类 × 20 run），可断点续跑。
 
-### 完整流水线采集
-
-```bash
-nohup scripts/collect/run_final_v2.sh > datasets/m6_run.log 2>&1 &
-```
-
 ---
 
 ## 二、预处理
@@ -133,7 +127,6 @@ python3 scripts/validate/compare_models.py --runs runs --out results/model_compa
 | 模型 | 类型 | 输入 | 评分方式 | 说明 |
 |------|------|------|---------|------|
 | ocsvm | 窗口特征 | features.npz (101维) | -score_samples | 基线（ThunderSVM GPU 自动适配） |
-| lstm_ae | 序列特征 | features.npz (32×101) | 重建误差 | 序列级基线 |
 | gru | 事件 token | token_sequences.npz (128) | top-g 违例率 | 结构轴 |
 | fusion_svdd | 统一双头 | token_sequences.npz (128) | 违例率 + SVDD 距离 | 主力，全 GPU |
 

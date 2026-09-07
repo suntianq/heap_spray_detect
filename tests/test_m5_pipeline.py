@@ -247,52 +247,5 @@ class TestM5Pipeline(unittest.TestCase):
         self.assertNotIn("inf", metrics.lower())
 
 
-class TestTorchWrapper(unittest.TestCase):
-    """Torch autoencoder adapter (models/torch_ae.py) under the venv interpreter.
-
-    The check runs as a VENV_PY subprocess against synthetic sequences and
-    asserts the wrapper's contract: shapes, finite scores, train-only scaler,
-    seed determinism, and the score_sequences dispatch.
-    """
-
-    SMOKE = r'''
-import json, os, sys
-sys.path.insert(0, os.path.abspath({root!r}))
-sys.path.insert(0, os.path.join(os.path.abspath({root!r}), "scripts", "train"))
-import numpy as np
-from models.torch_ae import TorchAEWrapper
-from scripts.train import common
-
-rng = np.random.default_rng(0)
-seqs = rng.normal(0, 3, size=(100, 32, 90)).astype(np.float32)
-out = dict()
-
-la = TorchAEWrapper("lstm_ae", seed=7, epochs=2, seq_batch_size=32)
-la.fit_sequences(seqs)
-sa = la.sequence_anomaly_score(seqs)
-out["lstmae_shape"] = list(sa.shape)
-out["lstmae_finite"] = bool(np.isfinite(sa).all())
-out["lstm_dispatch"] = list(common.score_sequences(la, seqs, "max").shape)
-lv = TorchAEWrapper("lstm_vae", seed=7, epochs=2, seq_batch_size=32)
-lv.fit_sequences(seqs)
-sv = lv.sequence_anomaly_score(seqs)
-out["lstmvae_shape"] = list(sv.shape)
-out["lstmvae_finite"] = bool(np.isfinite(sv).all())
-print(json.dumps(out))
-'''
-
-    def test_torch_wrapper_venv(self):
-        result = subprocess.run([str(VENV_PY), "-c", self.SMOKE.format(root=str(ROOT))],
-                                capture_output=True, text=True, cwd=str(ROOT))
-        self.assertEqual(result.returncode, 0,
-                         f"venv smoke failed:\n{result.stdout}\n{result.stderr}")
-        out = json.loads(result.stdout.strip().splitlines()[-1])
-        self.assertEqual(out["lstmae_shape"], [100, 32])
-        self.assertTrue(out["lstmae_finite"])
-        self.assertEqual(out["lstm_dispatch"], [100])
-        self.assertEqual(out["lstmvae_shape"], [100, 32])
-        self.assertTrue(out["lstmvae_finite"])
-
-
 if __name__ == "__main__":
     unittest.main()
