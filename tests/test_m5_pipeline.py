@@ -326,5 +326,31 @@ class ControlSplitTest(unittest.TestCase):
         self.assertEqual(int(pure.sum()), 0)
 
 
+class AggregateScoresTest(unittest.TestCase):
+    """The top-K mean must expose short bursts that a single order statistic hides."""
+
+    def test_topk_exposes_short_burst_p90_misses(self):
+        scores = np.array([
+            [1.0] * 128,                      # flat background
+            [1.0] * 123 + [50.0] * 5,         # 5-position burst in 128
+        ])
+        # p90 (rank ~14 from top) cannot see a 5-position burst
+        self.assertAlmostEqual(common.aggregate_scores(scores, "p90")[1], 1.0, places=6)
+        # topk8 lets the burst occupy 5 of 8 slots without touching flat noise
+        topk = common.aggregate_scores(scores, "topk8")
+        self.assertAlmostEqual(topk[0], 1.0, places=6)
+        self.assertAlmostEqual(topk[1], (5 * 50.0 + 3 * 1.0) / 8, places=6)
+
+    def test_topk_larger_than_sequence_falls_back_to_mean(self):
+        scores = np.array([[3.0, 1.0, 2.0]])
+        self.assertAlmostEqual(common.aggregate_scores(scores, "topk10")[0], 2.0, places=6)
+
+    def test_topk_invalid_k_rejected(self):
+        with self.assertRaises(ValueError):
+            common.aggregate_scores(np.zeros((1, 4)), "topk0")
+        with self.assertRaises(ValueError):
+            common.aggregate_scores(np.zeros((1, 4)), "topkx")
+
+
 if __name__ == "__main__":
     unittest.main()

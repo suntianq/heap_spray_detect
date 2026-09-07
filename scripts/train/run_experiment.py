@@ -199,7 +199,8 @@ def main():
     parser.add_argument("--test-fraction", type=float, default=common.DEFAULT_TEST_FRACTION)
     parser.add_argument("--target-fpr", type=float, default=common.DEFAULT_TARGET_FPR)
     parser.add_argument("--aggregation", default=None,
-                        help="sequence score aggregation (max|last|mean|pNN, default per model)")
+                        help="sequence score aggregation (max|last|mean|pNN|topkK, "
+                             "default per model)")
     parser.add_argument("--held-out-cve", default=None,
                         help="leave-one-CVE-out: exclude this CVE's attack from aggregate eval")
     args = parser.parse_args()

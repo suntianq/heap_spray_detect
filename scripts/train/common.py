@@ -197,6 +197,22 @@ def aggregate_scores(per_window, aggregation):
     if aggregation.startswith("p") and aggregation[1:].isdigit():
         q = int(aggregation[1:])
         return np.percentile(per_window, q, axis=1)
+    # Top-K mean: average of the K highest per-position scores. A single order
+    # statistic (pNN) is blind to a burst shorter than its tail rank -- a
+    # 5-position spray burst never moves p90 of a 128-position sequence -- while
+    # the top-K mean lets a short burst occupy a proportional share of the K
+    # slots (the dilution fix for short spray windows; K tuned on validation,
+    # explicit --aggregation until validated, then promoted to per-model default).
+    if aggregation.startswith("topk") and aggregation[4:].isdigit():
+        k = int(aggregation[4:])
+        if k <= 0:
+            raise ValueError(f"topk aggregation needs K >= 1, got {aggregation}")
+        length = per_window.shape[1]
+        top = min(k, length)
+        if top == length:
+            return per_window.mean(axis=1)
+        partitioned = np.partition(per_window, length - top, axis=1)
+        return partitioned[:, length - top:].mean(axis=1)
     raise ValueError(f"unknown score aggregation: {aggregation}")
 
 
