@@ -30,9 +30,10 @@ WORKLOAD_NET_SOURCE = Path(__file__).parent / "workloads" / "workload_net.c"
 WORKLOAD_FS_SOURCE = Path(__file__).parent / "workloads" / "workload_fs.c"
 WORKLOAD_FORK_SOURCE = Path(__file__).parent / "workloads" / "workload_fork.c"
 WORKLOAD_MEM_SOURCE = Path(__file__).parent / "workloads" / "workload_mem.c"
+WORKLOAD_BUSINESS_SOURCE = Path(__file__).parent / "workloads" / "workload_business.c"
 # Vendored keyutils dev files (stretch image and host both lack them): the header
 # and static lib come from libkeyutils-dev_1.6.3, uploaded offline (same as the
-# attack collector). keyctl workload links them.
+# attack collector). keyctl and business workloads link them.
 KEYUTILS_HEADER = Path(__file__).parent / "deps" / "keyutils.h"
 KEYUTILS_STATIC_LIB = Path(__file__).parent / "deps" / "libkeyutils.a"
 REMOTE_WORKLOAD_DIR = "/tmp/workloads"
@@ -45,8 +46,8 @@ def build_workloads_in_vm(port, workloads):
     The stretch image ships gcc/make but its glibc is 2.24 while the host is
     2.34+, so a host-compiled binary fails at load on the guest with "version
     GLIBC_2.34 not found". Compiling in the guest (the same pattern the attack
-    collector uses for PoCs) guarantees ABI compatibility. keyctl additionally
-    needs the vendored keyutils dev files when the image lacks them.
+    collector uses for PoCs) guarantees ABI compatibility. keyctl and business
+    additionally need the vendored keyutils dev files when the image lacks them.
     """
     require_remote_step(port, f"mkdir -p {REMOTE_WORKLOAD_DIR} && rm -f {REMOTE_WORKLOAD_DIR}/workload_*",
                         "prepare workload dir")
@@ -56,6 +57,9 @@ def build_workloads_in_vm(port, workloads):
         steps.append("gcc -O2 -pthread -o workload_msg workload_msg.c")
     if "keyctl" in workloads:
         upload_required(port, WORKLOAD_KEY_SOURCE, f"{REMOTE_WORKLOAD_DIR}/workload_key.c")
+    if "business" in workloads:
+        upload_required(port, WORKLOAD_BUSINESS_SOURCE, f"{REMOTE_WORKLOAD_DIR}/workload_business.c")
+    if "keyctl" in workloads or "business" in workloads:
         probe = require_remote_step(
             port,
             "test -f /usr/include/keyutils.h && test -f /usr/lib/x86_64-linux-gnu/libkeyutils.a "
@@ -64,7 +68,11 @@ def build_workloads_in_vm(port, workloads):
         if probe.strip() != "OK":
             upload_required(port, KEYUTILS_HEADER, "/usr/include/keyutils.h")
             upload_required(port, KEYUTILS_STATIC_LIB, "/usr/lib/x86_64-linux-gnu/libkeyutils.a")
+    if "keyctl" in workloads:
         steps.append("gcc -O2 -pthread -I/usr/include -o workload_key workload_key.c "
+                     "/usr/lib/x86_64-linux-gnu/libkeyutils.a")
+    if "business" in workloads:
+        steps.append("gcc -O2 -I/usr/include -o workload_business workload_business.c "
                      "/usr/lib/x86_64-linux-gnu/libkeyutils.a")
     if "net_busy" in workloads:
         upload_required(port, WORKLOAD_NET_SOURCE, f"{REMOTE_WORKLOAD_DIR}/workload_net.c")
@@ -118,6 +126,7 @@ def run_one(cve, cve_folder, workload, index, duration, pre_seconds, post_second
         "fs_io": WORKLOAD_FS_SOURCE,
         "fork_stress": WORKLOAD_FORK_SOURCE,
         "mem_pressure": WORKLOAD_MEM_SOURCE,
+        "business": WORKLOAD_BUSINESS_SOURCE,
     }
     source = {w: workload_sources[w] for w in workloads if w in workload_sources}
     manifest = {
@@ -175,6 +184,10 @@ def run_one(cve, cve_folder, workload, index, duration, pre_seconds, post_second
             remote_binary = f"{REMOTE_WORKLOAD_DIR}/workload_key"
             require_remote_step(ssh_port, f"{remote_binary} {duration}",
                                 "keyctl workload", timeout=duration + 20)
+        elif workload == "business":
+            remote_binary = f"{REMOTE_WORKLOAD_DIR}/workload_business"
+            require_remote_step(ssh_port, f"{remote_binary} {duration}",
+                                "business workload", timeout=duration + 20)
         elif workload == "net_busy":
             remote_binary = f"{REMOTE_WORKLOAD_DIR}/workload_net"
             require_remote_step(ssh_port, f"{remote_binary} {duration}",
@@ -238,9 +251,17 @@ def main():
     parser.add_argument("--pre-seconds", type=int, default=3)
     parser.add_argument("--post-seconds", type=int, default=3)
     parser.add_argument("-o", "--output", default=os.path.join(config.DATA_DIR, "raw_v2", "normal"))
-    parser.add_argument("-w", "--workloads", nargs="+", default=["idle", "msg_msg"],
-                        choices=["idle", "msg_msg", "keyctl", "net_busy", "fs_io",
-                                 "fork_stress", "mem_pressure"])
+    # Default set: realistic business-style workloads. msg_msg/keyctl churn are
+    # NOT collected by default anymore (design decision 2026-09-07): their
+    # single-path same-size allocation storms share the exact call_site+size
+    # signatures heap-spray exploits use, so a one-class model trained on them
+    # learns spray as "normal" (CVE-2017-8824 spray == keyctl churn 1:1).
+    # They stay available as explicit choices for control experiments; the
+    # business workload covers those paths at realistic, size-varied volume.
+    parser.add_argument("-w", "--workloads", nargs="+",
+                        default=["idle", "business", "net_busy", "fs_io"],
+                        choices=["idle", "msg_msg", "keyctl", "business", "net_busy",
+                                 "fs_io", "fork_stress", "mem_pressure"])
     parser.add_argument("--msg-sizes", nargs="+", type=int, default=[256, 2048],
                         help="msg_msg payload sizes to collect (bytes); one run set per size")
     args = parser.parse_args()

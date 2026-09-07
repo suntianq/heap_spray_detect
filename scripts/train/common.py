@@ -104,16 +104,38 @@ def is_baseline_run(run_id):
     return f"/{BASELINE_SEGMENT}/" in f"/{run_id}"
 
 
-def split_baseline_groups(groups):
-    """Split a run-id array into (baseline, true_normal) index arrays.
+# Churn normal workloads retired from the default collection (design decision
+# 2026-09-07): their single-path same-size allocation storms share the exact
+# call_site+size signatures that heap-spray exploits use, so a one-class model
+# trained on them learns spray as "normal" (CVE-2017-8824 spray == keyctl churn
+# 1:1, recall 0%). They are held out like baseline and scored as a second
+# near-attack control family. Collector workload labels are msg_msg_<payload>
+# (msg_msg_256 / msg_msg_2048) and keyctl.
+CHURN_WORKLOADS = ("msg_msg", "keyctl")
 
-    Baseline sequences/runs carry the poc_cfh_baseline workload segment and
-    must be excluded from the normal train/val/test pool. Return boolean masks
-    over `groups` aligned with the input array.
+
+def is_churn_run(run_id):
+    """True if run_id belongs to a retired churn (near-spray) normal workload."""
+    segments = str(run_id).split("/")
+    return any(seg == w or seg.startswith(w + "_")
+               for w in CHURN_WORKLOADS for seg in segments)
+
+
+def split_control_groups(groups):
+    """Three-way split of a run-id array into held-out control families.
+
+    Returns (baseline, churn, true_normal) boolean masks aligned with the
+    input array. Both control families are excluded from train/val/test (they
+    can neither train the model nor calibrate the threshold) and are scored at
+    the frozen threshold as separate near-attack axes:
+      * baseline: poc_cfh_baseline -- exploit trigger path, no spray;
+      * churn: retired msg_msg/keyctl workloads -- no exploit, but
+        spray-shaped allocation storms (same call_site+size as the sprays).
     """
     groups = np.asarray(groups).astype(str)
     is_base = np.array([is_baseline_run(g) for g in groups])
-    return is_base, ~is_base
+    is_churn = np.array([is_churn_run(g) for g in groups]) & ~is_base
+    return is_base, is_churn, ~(is_base | is_churn)
 
 
 def split_run_groups(groups, seed, val_fraction=DEFAULT_VAL_FRACTION,

@@ -5,7 +5,7 @@
 # pipeline:
 #   1. attack  -- exploit WITH heap-spray markers: single_spray + combo variants
 #   2. baseline -- exploit trigger path, NO spray (control group)
-#   3. normal  -- benign workloads (7 classes x NORMAL_RUNS)
+#   3. normal  -- benign business workloads (one set per workload x NORMAL_RUNS)
 #
 # Steps are serialized so QEMU/SSH never conflict. Each phase records a .done
 # marker and is skipped on re-launch (resumable). Run dirs carry unique uuids,
@@ -48,7 +48,12 @@ MIN_VALID="${MIN_VALID:-15}"                    # valid runs per attack/baseline
 MAX_ATTEMPTS_PER_VARIANT="${MAX_ATTEMPTS_PER_VARIANT:-60}"
 NORMAL_RUNS="${NORMAL_RUNS:-20}"                # per workload
 COLLECT_DURATION="${COLLECT_DURATION:-30}"      # seconds per normal run
-NORMAL_WORKLOADS="${NORMAL_WORKLOADS:-idle msg_msg keyctl net_busy fs_io fork_stress mem_pressure}"
+# msg_msg/keyctl churn are retired from the default set (2026-09-07): their
+# same-path same-size allocation storms mirror heap-spray signatures and teach
+# a one-class model that spray is normal. Override NORMAL_WORKLOADS to collect
+# them explicitly for control experiments. "business" mixes fs/pipe/net/proc
+# plus sparse size-varied IPC/keyctl ticks (workload_business.c).
+NORMAL_WORKLOADS="${NORMAL_WORKLOADS:-idle business net_busy fs_io fork_stress mem_pressure}"
 ATTACK_VARIANTS="${ATTACK_VARIANTS:-poc_cfh_single_spray poc_cfh_combo}"
 # CVE(s) whose crash the exploit is expected to trigger; VALID requires vm_crashed.
 EXPECT_CRASH="${EXPECT_CRASH:-$CVE}"

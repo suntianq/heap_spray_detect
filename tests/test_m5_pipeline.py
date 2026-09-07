@@ -79,7 +79,7 @@ def write_trace(path, background_size, spray=None, spray_start_ns=None, spray_en
 
 
 def build_synthetic_root(tmp):
-    """Create a CVE-first raw root with 2 attack, 4 idle, 3 baseline runs.
+    """Create a CVE-first raw root with 2 attack, 4 idle, 2 churn, 3 baseline runs.
 
     Layout (datasets restructure): raw/<CVE>/{attack,normal,baseline}/<variant|workload>/run/...
     """
@@ -87,6 +87,7 @@ def build_synthetic_root(tmp):
     spray_start, spray_end = 2_000_000_000, 2_200_000_000
     attack_dir = root / "raw" / "CVE-SYN-ATT" / "attack" / "poc_spray"
     normal_dir = root / "raw" / "CVE-SYN" / "normal" / "idle"
+    churn_dir = root / "raw" / "CVE-SYN" / "normal" / "msg_msg_256"
     base_dir = root / "raw" / "CVE-SYN" / "baseline" / "poc_cfh_baseline"
 
     for i in range(2):
@@ -106,6 +107,16 @@ def build_synthetic_root(tmp):
         with open(d / "manifest.json", "w") as f:
             json.dump({"status": "valid", "class": "normal", "cve": "CVE-SYN",
                        "workload": "idle"}, f)
+
+    for i in range(2):
+        d = churn_dir / f"run_00{i}_syn{i}"
+        d.mkdir(parents=True)
+        write_trace(d / "trace.log", 96)
+        with open(d / "manifest.json", "w") as f:
+            # churn workloads are normal-collector runs (spray-shaped allocation
+            # storms); the harness holds them out by the msg_msg_* run_id segment.
+            json.dump({"status": "valid", "class": "normal", "cve": "CVE-SYN",
+                       "workload": "msg_msg_256"}, f)
 
     for i in range(3):
         d = base_dir / f"run_00{i}_syn{i}"
@@ -173,6 +184,30 @@ class TestM5Pipeline(unittest.TestCase):
         for a, b in (("train_groups", "val_groups"), ("train_groups", "test_groups"),
                      ("val_groups", "test_groups")):
             self.assertEqual(set(split[a]) & set(split[b]), set(), f"{a}/{b} overlap")
+
+    def test_churn_family_held_out(self):
+        """Retired msg_msg/keyctl runs are held out like baseline: excluded from
+        train/val/test, scored at the frozen threshold as churn_near_attack (G11)."""
+        exp = self.experiments[0]
+        split = json.loads((exp / "split_manifest.json").read_text())
+        report = json.loads((exp / "evaluation_report.json").read_text())
+        gates = json.loads((exp / "gates.json").read_text())
+        churn_ids = split["churn_held_out"]
+        self.assertEqual(len(churn_ids), 2)
+        self.assertTrue(all("/msg_msg_256/" in g for g in churn_ids))
+        for pool in ("train_groups", "val_groups", "test_groups"):
+            self.assertEqual(set(split[pool]) & set(churn_ids), set(),
+                             f"churn run leaked into {pool}")
+        churn = report["churn_near_attack"]
+        self.assertEqual(churn["runs_total"], 2)
+        self.assertTrue(0 <= churn["runs_flagged"] <= churn["runs_total"])
+        self.assertIn(round(churn["detection_rate"] * 2), (0, 1, 2))
+        g11 = [g for g in gates if g["name"] == "G11_churn_held_out"]
+        self.assertEqual(len(g11), 1)
+        self.assertTrue(g11[0]["ok"])
+        # baseline behaviour unchanged: still held out and reported (G10)
+        self.assertEqual(report["baseline_near_attack"]["runs_total"], 3)
+        self.assertTrue(any(g["name"] == "G10_baseline_held_out" for g in gates))
 
     def test_threshold_is_validation_percentile_not_test_optimum(self):
         exp = self.experiments[0]
@@ -245,6 +280,50 @@ class TestM5Pipeline(unittest.TestCase):
         metrics = (self.experiments[0] / "metrics.csv").read_text()
         self.assertNotIn("nan", metrics.lower())
         self.assertNotIn("inf", metrics.lower())
+
+
+class ControlSplitTest(unittest.TestCase):
+    """Unit tests for the two near-attack control families (baseline + churn)."""
+
+    def test_is_churn_run_matches_retired_workloads(self):
+        for rid in ("CVE-2017-11176/msg_msg_256/run_000_x/trace",
+                    "CVE-2017-11176/msg_msg_2048/run_001_x/trace",
+                    "CVE-2017-11176/msg_msg/run_002_x/trace",
+                    "CVE-2017-11176/keyctl/run_003_x/trace"):
+            self.assertTrue(common.is_churn_run(rid), rid)
+        for workload in ("idle", "business", "net_busy", "fs_io",
+                         "fork_stress", "mem_pressure"):
+            rid = f"CVE-2017-11176/{workload}/run_000_x/trace"
+            self.assertFalse(common.is_churn_run(rid), rid)
+        # attack/baseline variants never look like churn
+        self.assertFalse(common.is_churn_run("CVE-2017-11176/poc_cfh_baseline/run_000_x/trace"))
+        self.assertFalse(common.is_churn_run("CVE-2017-11176/poc_cfh_single_spray/run_000_x/trace"))
+        self.assertFalse(common.is_churn_run("CVE-2017-11176/poc_cfh_combo/run_000_x/trace"))
+
+    def test_split_control_groups_three_way(self):
+        groups = np.array([
+            "CVE-A/idle/run_000_x/trace",
+            "CVE-A/msg_msg_256/run_001_x/trace",
+            "CVE-A/keyctl/run_002_x/trace",
+            "CVE-A/poc_cfh_baseline/run_003_x/trace",
+        ])
+        base, churn, pure = common.split_control_groups(groups)
+        self.assertEqual(int(base.sum()), 1)
+        self.assertEqual(int(churn.sum()), 2)
+        self.assertEqual(int(pure.sum()), 1)
+        # disjoint and exhaustive
+        self.assertFalse((base & churn).any())
+        self.assertFalse((base & pure).any())
+        self.assertFalse((churn & pure).any())
+        self.assertEqual(int((base | churn | pure).sum()), len(groups))
+
+    def test_split_control_groups_baseline_wins_over_churn(self):
+        # a poc_cfh_baseline id can never be claimed by the churn family
+        groups = np.array(["CVE-A/poc_cfh_baseline/run_000_x/trace"])
+        base, churn, pure = common.split_control_groups(groups)
+        self.assertEqual(int(base.sum()), 1)
+        self.assertEqual(int(churn.sum()), 0)
+        self.assertEqual(int(pure.sum()), 0)
 
 
 if __name__ == "__main__":

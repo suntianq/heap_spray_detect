@@ -206,6 +206,11 @@ def main():
         tasks = []  # [(in_path, out_path, rel_path, manifest_window)]
         for dirpath, _, filenames in os.walk(args.input):
             rel = os.path.relpath(dirpath, args.input)
+            # quarantine segment (written by scripts/validate/quarantine_workloads.py):
+            # retired churn workloads kept on disk as a near-attack control family.
+            # They are never a build input, so never convert them.
+            if "quarantine" in rel.split(os.sep):
+                continue
             out_dir = os.path.join(args.output, rel) if rel != "." else args.output
             os.makedirs(out_dir, exist_ok=True)
             status = manifest_status(dirpath)

@@ -38,7 +38,14 @@ POC_VARIANTS = [
     "poc_cfh_combo",
 ]
 
-WORKLOADS = ["idle", "net_busy", "msg_msg"]
+# Default normal-workload set. msg_msg/keyctl churn were retired from the
+# default collection (design decision 2026-09-07): their single-path same-size
+# allocation storms share the exact call_site+size signatures that heap-spray
+# exploits use, so a one-class model trained on them learns spray as "normal"
+# (CVE-2017-8824 spray == keyctl churn 1:1). "business" replaces them with a
+# mixed realistic workload (see scripts/collect/workloads/workload_business.c);
+# the churn workloads remain explicit collector choices for control runs.
+WORKLOADS = ["idle", "business", "net_busy", "fs_io"]
 
 NORMAL_RUNS = 10
 ATTACK_RUNS = 10

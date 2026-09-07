@@ -163,16 +163,18 @@ def main():
     seq_len = int(normal_seqs.shape[1])
 
     # ---- normal run split ----------------------------------------------------
-    # Baseline runs (poc_cfh_baseline) are near-attack controls held out of the
-    # normal pool entirely: they never train, calibrate, or count as clean
-    # normal in eval (design decision 2026-09-07). normal_groups_all stays the
-    # full per-sequence array (masks must align with normal_seqs rows); baseline
-    # is excluded by never putting a baseline run id into the run pools below.
+    # Baseline runs (poc_cfh_baseline) and churn runs (retired msg_msg/keyctl
+    # workloads) are near-attack controls held out of the normal pool entirely:
+    # they never train, calibrate, or count as clean normal in eval (design
+    # decision 2026-09-07). normal_groups_all stays the full per-sequence array
+    # (masks must align with normal_seqs rows); the control families are
+    # excluded by never putting one of their run ids into the run pools below.
     normal_groups_all = normal_seq_run_ids
-    baseline_seq_mask, _ = common.split_baseline_groups(normal_groups_all)
+    baseline_seq_mask, churn_seq_mask, _ = common.split_control_groups(normal_groups_all)
     baseline_groups_all = normal_seq_run_ids[baseline_seq_mask]
     pure_normal_runs = sorted({g for g in set(normal_groups_all.tolist())
-                               if not common.is_baseline_run(g)})
+                               if not (common.is_baseline_run(g)
+                                       or common.is_churn_run(g))})
     train_pool_groups = [g for g in pure_normal_runs if cve_of(g) in train_cves]
     train_pool_groups.sort()
     tr_groups, val_groups, held_test_groups = common.split_run_groups(
@@ -201,15 +203,21 @@ def main():
         "val_groups": val_groups,
         "eval_normal_groups": eval_normal_groups,
         "baseline_held_out": sorted({str(g) for g in baseline_groups_all}),
+        "churn_held_out": sorted({str(g) for g in normal_groups_all[churn_seq_mask]}),
         "baseline_policy": "near-attack test set: excluded from train/val/test",
+        "churn_policy": "retired msg_msg/keyctl near-spray workloads: excluded "
+                        "from train/val/test",
     }
     write_json(experiment_dir / "split_manifest.json", split_payload)
+    churn_groups_all = set(normal_groups_all[churn_seq_mask].tolist())
     g7_ok = (len(set(tr_groups) & set(val_groups)) == 0
              and len(set(tr_groups) & set(eval_normal_groups)) == 0
              and len(set(val_groups) & set(eval_normal_groups)) == 0
              and len(set(tr_groups) & set(baseline_groups_all)) == 0
              and len(set(val_groups) & set(baseline_groups_all)) == 0
-             and len(set(eval_normal_groups) & set(baseline_groups_all)) == 0)
+             and len(set(eval_normal_groups) & set(baseline_groups_all)) == 0
+             and not (set(tr_groups) | set(val_groups) | set(eval_normal_groups))
+             & churn_groups_all)
     gates = [{
         "name": "G7_run_split_no_overlap",
         "ok": g7_ok,

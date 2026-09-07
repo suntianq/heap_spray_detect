@@ -37,7 +37,7 @@ CVE=CVE-2017-7533 nohup scripts/collect/collect_cve_complete.sh \
     > datasets/.m6/logs/collect_CVE-2017-7533_complete.log 2>&1 &
 ```
 
-依次采集 attack（single_spray + combo）→ baseline → normal（7 类 × 20 run），可断点续跑。
+依次采集 attack（single_spray + combo）→ baseline → normal（业务负载 × 20 run），可断点续跑。
 
 ---
 

@@ -101,16 +101,16 @@ CVE=CVE-2017-7533 nohup scripts/collect/collect_cve_complete.sh \
     > datasets/.m6/logs/collect_CVE-2017-7533_complete.log 2>&1 &
 ```
 
-依次采集 attack（single_spray + combo）→ baseline → normal（7 类 × 20 run），每阶段打
+依次采集 attack（single_spray + combo）→ baseline → normal（业务负载 × 20 run），每阶段打
 `.done` 标记可断点续跑。`MIN_VALID`、`NORMAL_RUNS` 等可用环境变量覆盖。
 
 ### 手动采集
 
 ```bash
-# normal（8 类负载）
+# normal（业务负载）
 python scripts/collect/collect_stable.py -c CVE-2017-11176 -n 20 -d 30 \
-    -w idle msg_msg keyctl net_busy fs_io fork_stress mem_pressure \
-    --msg-sizes 256 2048 -o datasets/raw
+    -w idle business net_busy fs_io fork_stress mem_pressure \
+    -o datasets/raw
 
 # attack（喷雾变体）与 baseline——都必须带 --expect-crash
 python scripts/collect/collect_attack_stable.py -c CVE-2017-11176 CVE-2017-7308 \
@@ -121,8 +121,28 @@ python scripts/collect/collect_attack_stable.py -c CVE-2017-11176 CVE-2017-7308 
     --expect-crash CVE-2017-11176 CVE-2017-7308 --poc-timeout 90 -o datasets/raw
 ```
 
-负载类别：`idle`、`msg_msg_256`、`msg_msg_2048`、`keyctl`、`net_busy`、`fs_io`、
-`fork_stress`、`mem_pressure`。
+负载类别：`idle`、`business`（混合业务：文件 I/O + 管道 + 回环网络 + 进程派生，
+外加低频、size 多样化的 msg/keyctl 操作）、`net_busy`、`fs_io`、`fork_stress`、
+`mem_pressure`。`msg_msg_256/2048`、`keyctl` churn 已从默认采集退役（设计决策
+2026-09-07）：它们与 exploit spray 使用完全相同的 call_site+size 签名，会把 spray
+"教成正常"（CVE-2017-8824 recall 0% 的根因）；如需对照实验可用 `-w msg_msg keyctl`
+显式采集，历史 churn 数据按下一节隔离、不作训练数据。
+
+### 迁移已有 raw 数据（churn 负载隔离）
+
+```bash
+python scripts/validate/quarantine_workloads.py                       # 预览（dry run）
+python scripts/validate/quarantine_workloads.py --apply               # 执行迁移
+```
+
+把 `raw/<CVE>/normal/{msg_msg_256,msg_msg_2048,keyctl}` 整体移入同 CVE 下的
+`raw/<CVE>/quarantine/<workload>/`（布局不变、可逆），并写
+`raw/<CVE>/quarantine/quarantine_manifest.json` 留档。下游对 `quarantine` 路径段
+自动免疫：trace2csv 不转换、manifest registry 不收录；迁移后重建 processed
+（build_pilot_dataset + trace2tokens）即从训练池彻底剔除。即使暂不重建，训练
+harness 也会按 run_id 的 workload 段（`msg_msg_*`/`keyctl`）自动 hold-out 这些
+run（不训练、不参与阈值校准），并在评估报告中单独输出 `churn_near_attack`
+对照轴（G11 门禁记录型）。
 
 **`--expect-crash` 是必需的**：这些 PoC 在很大比例 run 里会把 guest 打崩，不带该参数崩溃
 run 会被判无效（历史回归：11176/combo 曾因此 0/15 有效）。

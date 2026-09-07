@@ -176,8 +176,16 @@ def build_dataset_manifest(out, raw_dirs):
     manifest_path = out / "dataset_manifest.json"
     template = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     registry = {}
+    skipped_quarantined = 0
     for raw_dir in raw_dirs:
         for manifest_file in sorted(Path(raw_dir).rglob("manifest.json")):
+            # quarantine attic (scripts/validate/quarantine_workloads.py): retired
+            # churn workloads kept as a near-attack control family. They are not
+            # part of any build, so keep them out of the run registry/counts --
+            # their own quarantine_manifest.json is the traceability record.
+            if "quarantine" in manifest_file.relative_to(raw_dir).parts:
+                skipped_quarantined += 1
+                continue
             try:
                 m = json.loads(manifest_file.read_text())
             except (json.JSONDecodeError, OSError):
@@ -198,6 +206,9 @@ def build_dataset_manifest(out, raw_dirs):
                 "error": m.get("error"),
             }
     template["run_registry"] = dict(sorted(registry.items()))
+    if skipped_quarantined:
+        print(f"manifest registry: skipped {skipped_quarantined} quarantined runs "
+              "(raw/<CVE>/quarantine/)")
     valid = sum(1 for r in registry.values() if r["status"] == "valid")
     template["status"] = "ready" if registry else template.get("status", "empty")
     template["updated"] = datetime.now(timezone.utc).isoformat()

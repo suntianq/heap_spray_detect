@@ -151,6 +151,41 @@ def git_revision():
         return None
 
 
+def near_attack_family_report(seq_scores, seq_groups, threshold):
+    """Flag-rate report for one held-out near-attack control family.
+
+    Family runs are scored at the SAME frozen threshold as the main eval and
+    reported as an independent quality axis, never folded into run_metrics
+    (normal-vs-attack): baseline executes the full exploit trigger path (no
+    large spray) and churn (retired msg_msg/keyctl workloads) shares the
+    spray's call_site+size allocation signature without the exploit — where
+    each rate should sit between the normal FPR and attack recall is exactly
+    what these held-out experiments measure.
+    """
+    run_scores, run_ids = common.run_max_scores(seq_scores, seq_groups)
+    flagged = np.asarray(run_scores) > threshold
+    report = {
+        "runs_total": int(len(run_scores)),
+        "runs_flagged": int(flagged.sum()),
+        "detection_rate": float(flagged.mean()) if len(flagged) else 0.0,
+        "by_cve": {},
+    }
+    # control run ids are unprefixed (CVE/sub/run_.../trace) -- parse_group
+    # expects the "normal:"/"attack:" class prefix used on the run pool, so
+    # extract the CVE segment directly instead.
+    run_id_arr = np.asarray(run_ids).astype(str)
+    cves = np.asarray([str(g).split("/", 1)[0] for g in run_id_arr])
+    for cve in sorted({str(c) for c in cves}):
+        m = cves == cve
+        n = int(m.sum())
+        f = int(flagged[m].sum())
+        report["by_cve"][str(cve)] = {
+            "runs_total": n, "runs_flagged": f,
+            "detection_rate": float(f / n) if n else 0.0,
+        }
+    return report
+
+
 def main():
     parser = argparse.ArgumentParser(description="M5 no-leak train/evaluate pipeline")
     parser.add_argument("--model", default="ocsvm",
@@ -259,17 +294,24 @@ def main():
 
     # ---- 1. run split (G7) ------------------------------------------------
     # Baseline runs (poc_cfh_baseline) are near-attack controls that the
-    # collector executed through the full exploit path (no large spray). They
-    # must NOT train or calibrate the model, and must not be scored as clean
-    # normal: hold them out of the normal pool and evaluate them separately as
-    # a near-attack test set (see step 5). The run_id keeps the
-    # poc_cfh_baseline workload segment, so separation is exact.
+    # collector executed through the full exploit path (no large spray), and
+    # churn runs (retired msg_msg/keyctl workloads) are spray-shaped allocation
+    # storms without the exploit. Neither may train or calibrate the model, and
+    # neither counts as clean normal: hold both families out of the normal
+    # train/val/test pool and evaluate them separately as near-attack test sets
+    # (see step 5). run_ids keep their workload/variant segments
+    # (poc_cfh_baseline, msg_msg_*, keyctl), so separation is exact even when
+    # the processed dataset was built before the raw churn quarantine.
     normal_groups_all = normal_seq_run_ids
-    baseline_seq_mask, true_normal_seq_mask = common.split_baseline_groups(normal_groups_all)
+    baseline_seq_mask, churn_seq_mask, true_normal_seq_mask = \
+        common.split_control_groups(normal_groups_all)
     baseline_groups_all = normal_seq_run_ids[baseline_seq_mask]
+    churn_groups_all = normal_seq_run_ids[churn_seq_mask]
     normal_groups_true = normal_seq_run_ids[true_normal_seq_mask]
     if not len(baseline_groups_all):
         log.warning("no baseline runs found in --normal-data; near-attack eval empty")
+    if not len(churn_groups_all):
+        log.info("no churn runs (msg_msg/keyctl) in --normal-data; churn control eval empty")
     train_groups, val_groups, test_groups = common.split_run_groups(
         normal_groups_true, args.seed, args.val_fraction, args.test_fraction)
     train_seq_mask = common.mask_for_groups(normal_groups_all, train_groups)
@@ -299,7 +341,10 @@ def main():
         "test_groups": test_groups,
         "held_out_cve": args.held_out_cve,
         "baseline_held_out": sorted({str(g) for g in baseline_groups_all}),
+        "churn_held_out": sorted({str(g) for g in churn_groups_all}),
         "baseline_policy": "near-attack test set: excluded from train/val/test",
+        "churn_policy": "retired msg_msg/keyctl near-spray workloads: excluded "
+                        "from train/val/test",
     }
     write_json(experiment_dir / "split_manifest.json", split_payload)
     g7_ok = (len(set(train_groups) & set(val_groups)) == 0
@@ -307,12 +352,16 @@ def main():
              and len(set(val_groups) & set(test_groups)) == 0
              and len(set(train_groups) & set(baseline_groups_all)) == 0
              and len(set(val_groups) & set(baseline_groups_all)) == 0
-             and len(set(test_groups) & set(baseline_groups_all)) == 0)
+             and len(set(test_groups) & set(baseline_groups_all)) == 0
+             and len(set(train_groups) & set(churn_groups_all)) == 0
+             and len(set(val_groups) & set(churn_groups_all)) == 0
+             and len(set(test_groups) & set(churn_groups_all)) == 0)
     gates = [{
         "name": "G7_run_split_no_overlap",
         "ok": g7_ok,
         "detail": f"train={len(train_groups)} val={len(val_groups)} test={len(test_groups)} "
-                  f"runs (+{len(set(baseline_groups_all))} baseline held out), "
+                  f"runs (+{len(set(baseline_groups_all))} baseline, "
+                  f"+{len(set(churn_groups_all))} churn held out), "
                   f"pairwise-disjoint={g7_ok}",
     }]
 
@@ -398,47 +447,37 @@ def main():
     attack_scores_all = common.score_sequences(model, attack_sequences_all, args.aggregation)
     del attack_sequences_all
 
-    # Baseline (near-attack) evaluation: score every baseline run held out of
-    # train/val/test at the SAME frozen threshold, report the detection rate per
-    # CVE. Baseline executes the full exploit trigger path (no large spray), so
-    # a detector of spray-vs-clean behaviour should flag it *more* than normal
-    # but *less* than attack; the rate is an independent quality axis, never
-    # folded into run_metrics (normal-vs-attack).
-    baseline_sequences = normal_seqs[baseline_seq_mask].astype(seq_dtype)
-    baseline_groups_arr = normal_groups_all[baseline_seq_mask]
-    if len(baseline_sequences):
-        baseline_scores = common.score_sequences(model, baseline_sequences, args.aggregation)
-        baseline_run_scores, baseline_run_ids = common.run_max_scores(
-            baseline_scores, baseline_groups_arr)
-        baseline_run_flagged = np.asarray(baseline_run_scores) > run_threshold
-        baseline_report = {
-            "runs_total": int(len(baseline_run_scores)),
-            "runs_flagged": int(baseline_run_flagged.sum()),
-            "detection_rate": float(baseline_run_flagged.mean()) if len(baseline_run_flagged) else 0.0,
-            "by_cve": {},
-        }
-        # baseline run ids are unprefixed (CVE/sub/run_.../trace) -- parse_group
-        # expects the "normal:"/"attack:" class prefix used on the run pool, so
-        # extract the CVE segment directly instead.
-        baseline_run_id_arr = np.asarray(baseline_run_ids).astype(str)
-        baseline_cves = np.asarray([str(g).split("/", 1)[0] for g in baseline_run_id_arr])
-        for cve in sorted({str(c) for c in baseline_cves}):
-            m = baseline_cves == cve
-            n = int(m.sum())
-            f = int(baseline_run_flagged[m].sum())
-            baseline_report["by_cve"][str(cve)] = {
-                "runs_total": n, "runs_flagged": f,
-                "detection_rate": float(f / n) if n else 0.0,
-            }
-        log.info("baseline near-attack: %d/%d runs flagged "
-                 "(detection_rate=%.2f) at run_threshold=%.6f",
-                 baseline_report["runs_flagged"], baseline_report["runs_total"],
-                 baseline_report["detection_rate"], run_threshold)
-        del baseline_sequences
-    else:
-        baseline_report = {"runs_total": 0, "runs_flagged": 0, "detection_rate": 0.0,
-                           "by_cve": {},
-                           "note": "no baseline runs in --normal-data"}
+    # ---- near-attack control families ---------------------------------------
+    # Both families are scored at the SAME frozen threshold and reported
+    # separately (baseline_near_attack / churn_near_attack). Baseline executes
+    # the full exploit trigger path (no large spray), so a detector of
+    # spray-vs-clean behaviour should flag it *more* than normal but *less*
+    # than attack. Churn (retired msg_msg/keyctl workloads) shares the spray's
+    # allocation signature without the exploit: its flag rate measures how much
+    # of the detection is signature-shaped vs behaviour-shaped. Empty when the
+    # raw churn workloads were already quarantined before the processed rebuild.
+    control_reports = {}
+    for family, seq_mask, groups_arr, empty_note in (
+            ("baseline_near_attack", baseline_seq_mask, normal_groups_all[baseline_seq_mask],
+             "no baseline runs in --normal-data"),
+            ("churn_near_attack", churn_seq_mask, normal_groups_all[churn_seq_mask],
+             "no churn (msg_msg/keyctl) runs in --normal-data")):
+        family_seqs = normal_seqs[seq_mask].astype(seq_dtype)
+        if len(family_seqs):
+            family_scores = common.score_sequences(model, family_seqs, args.aggregation)
+            control_reports[family] = near_attack_family_report(
+                family_scores, groups_arr, run_threshold)
+            log.info("%s: %d/%d runs flagged (detection_rate=%.2f) at run_threshold=%.6f",
+                     family, control_reports[family]["runs_flagged"],
+                     control_reports[family]["runs_total"],
+                     control_reports[family]["detection_rate"], run_threshold)
+            del family_seqs
+        else:
+            control_reports[family] = {"runs_total": 0, "runs_flagged": 0,
+                                       "detection_rate": 0.0, "by_cve": {},
+                                       "note": empty_note}
+    baseline_report = control_reports["baseline_near_attack"]
+    churn_report = control_reports["churn_near_attack"]
     score_seconds = time.perf_counter() - _t_score
     scored_sequences = len(test_scores) + len(attack_scores_all)
 
@@ -513,6 +552,7 @@ def main():
         "grouped": {"by_workload": by_workload, "by_cve": by_cve,
                     "by_variant": by_variant, "by_slab": by_slab},
         "baseline_near_attack": baseline_report,
+        "churn_near_attack": churn_report,
         "counts": {
             "test_normal_sequences": int(len(test_scores)),
             "test_normal_runs": int(len(set(test_groups_arr.tolist()))),
@@ -522,6 +562,7 @@ def main():
             "ignored_boundary_sequences": int(np.sum(attack_seq_labels < 0)),
             "attack_runs_total": len(attack_run_ids),
             "attack_runs_no_spray_sequence": attack_runs_no_spray,
+            "churn_sequences_evaluated": int(churn_seq_mask.sum()),
         },
         "inference": {
             "score_seconds": round(score_seconds, 4),
@@ -584,6 +625,24 @@ def main():
                        f"held out of train/val/test"),
         })
 
+    # G11 mirrors G10 for the churn family: retired msg_msg/keyctl workloads
+    # share the spray's call_site+size signature without the exploit, so their
+    # flag rate measures signature-shaped vs behaviour-shaped detection. There
+    # is no hard pass/fail target -- informational, observed not hidden.
+    if churn_report.get("runs_total", 0) == 0:
+        gates.append({"name": "G11_churn_held_out", "ok": True,
+                      "detail": "no churn (msg_msg/keyctl) runs in --normal-data; "
+                                "churn control not evaluated"})
+    else:
+        gates.append({
+            "name": "G11_churn_held_out",
+            "ok": True,
+            "detail": (f"{churn_report['runs_flagged']}/{churn_report['runs_total']} "
+                       f"churn runs flagged at run_threshold={run_threshold:.6f} "
+                       f"(detection_rate={churn_report['detection_rate']:.3f}); "
+                       f"held out of train/val/test"),
+        })
+
     write_json(experiment_dir / "gates.json", gates)
     gate_report(gates)
 
@@ -596,6 +655,9 @@ def main():
     row["baseline_runs_total"] = baseline_report.get("runs_total", "")
     row["baseline_runs_flagged"] = baseline_report.get("runs_flagged", "")
     row["baseline_detection_rate"] = baseline_report.get("detection_rate", "")
+    row["churn_runs_total"] = churn_report.get("runs_total", "")
+    row["churn_runs_flagged"] = churn_report.get("runs_flagged", "")
+    row["churn_detection_rate"] = churn_report.get("detection_rate", "")
     with open(experiment_dir / "metrics.csv", "w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=sorted(row))
         writer.writeheader()
