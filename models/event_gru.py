@@ -297,11 +297,16 @@ class EventGRUDetector:
 
     # ---- training ----------------------------------------------------------
 
-    def fit_sequences(self, event_fields):
+    def fit_sequences(self, event_fields, calibrate=True):
         """Train field-wise next-event prediction on normal event matrices.
 
         Args:
             event_fields: (N, L, 8) float32 field matrix.
+            calibrate: if True (default), fit per-field z-score stats on this
+                (training) set before returning. Set False to leave stats
+                untouched so the harness can re-calibrate on validation data --
+                training-set stats are biased low because a fit model overfits
+                its own training sequences, which skews scoring.
         """
         self.net = self._make_net()
         device = self._device()
@@ -350,8 +355,11 @@ class EventGRUDetector:
             scheduler.step(avg_loss)
         epoch_pbar.close()
         self.net.eval()
-        # Calibrate per-field z-score stats on the same normal training set.
-        self._compute_score_stats(event_fields)
+        # Calibrate per-field z-score stats on the same normal training set
+        # (skipped when calibrate=False: the harness re-calibrates on
+        # validation so the stats are not biased by training-set overfit).
+        if calibrate:
+            self._compute_score_stats(event_fields)
         return self
 
     # ---- scoring -----------------------------------------------------------

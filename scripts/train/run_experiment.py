@@ -66,9 +66,9 @@ MODEL_CONFIG = {
     "gru": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3, "g": 10,
             "vocab_size": 13824},
     "event_gru": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3,
-                  "g_size": 3, "cs_vocab": 4096, "w_op": 0.05, "w_size": 0.25,
+                  "g_size": 3, "cs_vocab": 4096, "w_op": 0.05, "w_size": 0.30,
                   "w_csrep": 0.15, "w_cpu": 0.05, "w_reclaim": 0.05,
-                  "w_life": 0.20, "w_dt": 0.25},
+                  "w_life": 0.10, "w_dt": 0.25},
     "fusion_svdd": {"d_model": 128, "n_layers": 2, "epochs": 20, "lr": 1e-3,
                     "g": 10, "svdd_loss_weight": 0.1, "svdd_score_weight": 0.3,
                     "vocab_size": 13824},
@@ -311,7 +311,14 @@ def main():
     if args.model in SEQUENCE_MODELS:
         train_dtype = np.int32 if is_token_model else np.float32
         train_seqs = normal_seqs[train_seq_mask].astype(train_dtype)
-        model.fit_sequences(train_seqs)
+        # event_gru: calibrate=False so the z-score stats are fit on validation
+        # below, not the training set. Training-set stats are biased low (a fit
+        # model overfits its own train sequences), which inflates every
+        # non-training score and distorts the threshold.
+        if args.model == "event_gru":
+            model.fit_sequences(train_seqs, calibrate=False)
+        else:
+            model.fit_sequences(train_seqs)
         log.info("model=%s trained on %d train sequences", args.model, len(train_seqs))
     else:
         train_windows = normal["features"][train_window_mask].astype(np.float32)
@@ -332,6 +339,11 @@ def main():
     # ---- 3. threshold calibration on validation-normal FPR ------------------
     val_sequences = normal_seqs[val_seq_mask].astype(seq_dtype)
     val_groups_arr = normal_groups_all[val_seq_mask]
+    # event_gru: refit per-field z-score stats on validation normal sequences
+    # (fit_sequences was called with calibrate=False above). Calibrating on the
+    # same distribution the threshold is measured on keeps the z-scores honest.
+    if args.model == "event_gru":
+        model._compute_score_stats(val_sequences.astype(np.float32))
     val_seq_scores = common.score_sequences(model, val_sequences, args.aggregation)
     val_run_scores, val_run_ids = common.run_max_scores(val_seq_scores, val_groups_arr)
     run_threshold = common.threshold_at_fpr(val_run_scores, args.target_fpr)
